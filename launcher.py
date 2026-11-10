@@ -22,8 +22,28 @@ QT_DIR = os.path.join(os.environ.get('USERPROFILE', ''),
                       '.zcode', 'tools', 'qt', '5.15.2', 'msvc2019_64')
 
 
+def _preload_msvc_runtime():
+    """先按名字载入系统 MSVC 运行库，避免后续扩展模块拿到 Qt 自带的旧版本。
+
+    PyQt5 wheel 的 Qt5/bin 里有 msvcp140/vcruntime140 等运行库，_prepare_qt()
+    把这个目录注册进 DLL 搜索路径后，先导入 PyQt5 再导入 onnxruntime（声纹门禁、
+    RIFE 补帧）会解析到这些旧版本并直接 access violation，进程无提示退出。
+    进程内同名 DLL 只加载一次，因此这里先加载系统版本，后续依赖复用同一模块即可。
+    """
+    if os.name != 'nt':
+        return
+    import ctypes
+    for dll in ('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll',
+                'vcruntime140.dll', 'vcruntime140_1.dll'):
+        try:
+            ctypes.WinDLL(dll)
+        except OSError:
+            pass
+
+
 def _prepare_qt():
     """在导入 PyQt5 之前：设置正确的 Qt DLL 和插件路径，解决平台插件初始化失败问题"""
+    _preload_msvc_runtime()
     qt_bin = None
     qt_plugins = None
     

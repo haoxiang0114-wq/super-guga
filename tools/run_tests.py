@@ -58,7 +58,8 @@ cases = [
     ('happy|bounce|咕嘎嘎～', ('happy', 'bounce', '咕嘎嘎～')),
     ('surprised|shake|咕嘎？！', ('surprised', 'shake', '咕嘎？！')),
     ('normal|peek|哼', ('normal', 'peek', '哼')),
-    ('sad|tsundere|才不是担心你', ('sad', 'tsundere', '才不是担心你')),
+    # tsundere 由 core.embodiment 统一映射为动画名 head_shake，这里按映射后的结果断言
+    ('sad|tsundere|才不是担心你', ('sad', 'head_shake', '才不是担心你')),
     ('没有竖线格式的回复', ('normal', 'none', '没有竖线格式的回复')),
 ]
 for raw, want in cases:

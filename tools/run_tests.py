@@ -95,6 +95,17 @@ from core.asr import ASRRecorder, MODEL_DIR
 check('Vosk模型存在', os.path.isdir(MODEL_DIR), MODEL_DIR)
 rec = ASRRecorder()
 check('ASR依赖就绪', rec.available, '')
+check('手动录音后端', rec.backend in ('qwen', 'vosk'), rec.backend)
+
+# 千问语音：只验证配置解析与音频打包，不联网、不消耗额度
+from core import qwen_speech
+qcfg = qwen_speech.speech_settings()
+check('千问语音配置可解析', qcfg.get('asr_model') == 'qwen3-asr-flash'
+      and qcfg.get('tts_model') == 'qwen3-tts-flash' and bool(qcfg.get('tts_voice')),
+      qwen_speech.describe(qcfg))
+check('千问语音 WAV 打包', len(qwen_speech.pcm_to_wav(bytes(3200))) == 3244, '16k/16bit 单声道')
+check('千问语音密钥状态', True,
+      '已配置' if qcfg.get('api_key') else '未配置（按住说话自动用本地 Vosk）')
 
 print()
 print(f'===== 结果: {PASS} 通过 / {FAIL} 失败 =====')

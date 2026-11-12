@@ -33,5 +33,17 @@
     "free_quota_confirmed_model": "",
     "provider": "qianwen",
     "free_quota_confirmed_provider": ""
+  },
+  "qwen_speech": {
+    "enabled": true,
+    "provider": "",
+    "api_key": "",
+    "base_url": "",
+    "asr_model": "qwen3-asr-flash",
+    "tts_model": "qwen3-tts-flash",
+    "tts_voice": "Cherry",
+    "language_type": "Chinese",
+    "asr_backend": "auto",
+    "timeout": 30
   }
 }

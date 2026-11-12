@@ -1249,7 +1249,8 @@ class PetWindow(QWidget):
         if self._asr is None:
             self._asr = ASRRecorder()
         if not self._asr.available:
-            self._say_with_expression("咕嘎？语音模块没就绪，用打字吧。", "sad", "none")
+            hint = getattr(self._asr, 'hint', '语音模块没就绪')
+            self._say_with_expression(f"咕嘎？{hint}，先用打字吧。", "sad", "none")
             return
         self._recording = True
         self._asr.start()

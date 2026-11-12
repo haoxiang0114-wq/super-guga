@@ -236,6 +236,25 @@ try:
 except Exception as e:
     line('warn', '模型目录', f'{type(e).__name__}: {e}')
 
+# ---------------- 9. 千问语音（在线识别 + 合成）----------------
+section('千问语音（qwen3-asr-flash / qwen3-tts-flash）')
+try:
+    from core import qwen_speech
+    from core.asr import resolve_backend
+    qcfg = qwen_speech.speech_settings()
+    line('ok', '手动录音后端', resolve_backend())
+    if qcfg.get('api_key'):
+        line('ok', '千问密钥', f"已配置（{len(qcfg['api_key'])} 位）")
+        line('ok', '服务地址', qwen_speech.api_root(qcfg))
+        line('ok', '语音模型', f"{qcfg['asr_model']} / {qcfg['tts_model']}（{qcfg['tts_voice']}）")
+        line('ok' if qcfg.get('enabled') else 'warn', '开关',
+             '已启用' if qcfg.get('enabled') else 'qwen_speech.enabled = false')
+    else:
+        line('warn', '千问密钥',
+             '未配置：填 qwen_speech.api_key 或沿用实时语音密钥（不影响本地 Vosk）')
+except Exception as e:
+    line('warn', '千问语音', f'{type(e).__name__}: {e}')
+
 # ---------------- 9. 可选：网络 ----------------
 if '--net' in sys.argv:
     section('模型接口连通性')

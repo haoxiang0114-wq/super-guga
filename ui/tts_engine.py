@@ -150,15 +150,20 @@ class TTSEngine(QObject):
 
         print(f"[TTS] edge-tts(软萌音): {'可用' if self._use_edge else '不可用'}")
         print(f"[TTS] 豆包语音V3: {'可用' if self._use_doubao else '未配置'}")
+        print(f"[TTS] 千问语音({self.qwen.get('tts_model')}/{self.qwen.get('tts_voice')}): "
+              f"{'可用' if self.qwen_ready else '未配置'}")
 
     # ---- 依赖检查 ----
     def reload_settings(self):
         from core.model_settings import read_raw
+        from core import qwen_speech
         cfg=read_raw()
         self.provider=cfg.get('tts_provider') or 'edge'
         self.EDGE_VOICE=cfg.get('edge_voice') or type(self).EDGE_VOICE
         self.EDGE_RATE=cfg.get('edge_rate') or type(self).EDGE_RATE
         self.EDGE_PITCH=cfg.get('edge_pitch') or type(self).EDGE_PITCH
+        self.qwen=qwen_speech.speech_settings(cfg)
+        self.qwen_ready=qwen_speech.available(self.qwen)
 
     def _check_edge_tts(self):
         try:
@@ -265,7 +270,15 @@ class TTSEngine(QObject):
             success = False
             used = ''
             provider = getattr(self, 'provider', 'edge')
-            if self._use_edge and (provider == 'edge' or voice_profile):
+            if provider == 'qianwen' and not voice_profile:
+                # 千问 qwen3-tts-flash：返回真实后缀的音频文件，替换掉预建的空 mp3
+                qwen_path = self._synth_qwen(text, os.path.dirname(tmp_path))
+                if qwen_path:
+                    self._safe_remove(tmp_path)
+                    tmp_path = qwen_path
+                    success = True
+                    used = 'qianwen'
+            if not success and self._use_edge and (provider in ('edge', 'qianwen') or voice_profile):
                 success = self._synth_edge(text, tmp_path, voice_profile)
                 if success:
                     used = 'edge'
@@ -278,7 +291,7 @@ class TTSEngine(QObject):
 
             if not success:
                 if not self.last_error:
-                    self.last_error = '合成失败（edge 与豆包均不可用）'
+                    self.last_error = '合成失败（千问 / edge / 豆包均不可用）'
                 # 失败: 清掉空文件, 通知主线程收尾
                 self._safe_remove(tmp_path)
                 self._synth_failed.emit(token)
@@ -304,6 +317,15 @@ class TTSEngine(QObject):
                 self._synth_failed.emit(token)
             except Exception:
                 pass
+
+    def _synth_qwen(self, text: str, out_dir: str):
+        """千问语音合成（qwen3-tts-flash）→ 本地音频路径；失败返回 None"""
+        try:
+            from core import qwen_speech
+            return qwen_speech.synthesize(text, out_dir=out_dir, settings=self.qwen)
+        except Exception as e:
+            print(f"[TTS] 千问语音错误: {e}", file=sys.stderr)
+            return None
 
     def _synth_edge(self, text: str, out_path: str, voice_profile=None) -> bool:
         """edge-tts 合成, 加超时防止网络卡死"""
@@ -480,7 +502,7 @@ class TTSEngine(QObject):
         try:
             tmp_dir = tempfile.gettempdir()
             now = time.time()
-            for f in glob.glob(os.path.join(tmp_dir, _TMP_PREFIX + '*.mp3')):
+            for f in glob.glob(os.path.join(tmp_dir, _TMP_PREFIX + '*')):
                 try:
                     # 只清 1 天以内的(避免误删他人文件), 老文件系统自己会清
                     if now - os.path.getmtime(f) < 86400:

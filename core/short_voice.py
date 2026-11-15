@@ -35,7 +35,7 @@ class ShortVoice(QObject):
                 if self.recorder is None:
                     from core.asr import ASRRecorder
                     self.recorder=(self.factory or ASRRecorder)()
-                if not self.recorder.available:raise RuntimeError('离线语音识别未就绪，请检查 Vosk 模型和麦克风依赖')
+                if not self.recorder.available:raise RuntimeError(getattr(self.recorder,'hint','离线语音识别未就绪，请检查 Vosk 模型和麦克风依赖'))
                 if stop.is_set() or generation!=self.generation:return
                 if before_start:before_start()
                 if stop.is_set() or generation!=self.generation:return

@@ -10,7 +10,7 @@ class DesktopConsole(QDialog):
     checked=pyqtSignal(bool,str)
     def __init__(self,pet):
         super().__init__(None,Qt.Window|Qt.WindowStaysOnTopHint)
-        self.pet=pet;self.setWindowTitle('咕嘎 · 桌面管理台');self.resize(560,440)
+        self.pet=pet;self.setWindowTitle('咕嘎 · 桌面管理台');self.resize(580,500)
         self.raw=read_raw()
         try:self.cfg=resolve_config(self.raw)
         except Exception:self.cfg=dict(self.raw)
@@ -27,13 +27,18 @@ class DesktopConsole(QDialog):
         self.test=QPushButton('测试驱动模型连接');self.test.clicked.connect(self.check_driver);form.addRow(self.test)
         tabs.addTab(driver,'大模型（驱动层）')
         speech=QWidget();speech_form=QFormLayout(speech)
-        self.tts=QComboBox();self.tts.addItem('Edge TTS（默认，无需密钥）','edge');self.tts.addItem('豆包语音（需已有密钥）','doubao')
+        self.tts=QComboBox();self.tts.addItem('Edge TTS（默认，无需密钥）','edge');self.tts.addItem('豆包语音（需已有密钥）','doubao');self.tts.addItem('千问语音 qwen3-tts-flash（需 API Key）','qianwen')
         self.tts.setCurrentIndex(max(0,self.tts.findData(self.raw.get('tts_provider','edge'))))
         speech_form.addRow('语音输出',self.tts)
         self.voice=QLineEdit(self.raw.get('edge_voice','zh-CN-XiaoyiNeural'));speech_form.addRow('Edge 音色',self.voice)
         self.rate=QLineEdit(self.raw.get('edge_rate','+15%'));speech_form.addRow('语速',self.rate)
         self.pitch=QLineEdit(self.raw.get('edge_pitch','+14Hz'));speech_form.addRow('音调',self.pitch)
-        speech_form.addRow(QLabel('不设置时直接使用 Edge TTS；手动录音使用本地识别。'))
+        qwen=dict(self.raw.get('qwen_speech') or {})
+        self.qwen_key=QLineEdit();self.qwen_key.setEchoMode(QLineEdit.Password)
+        self.qwen_key.setPlaceholderText('已保存，留空不修改' if qwen.get('api_key') else '可沿用实时语音里的千问密钥')
+        speech_form.addRow('千问 API Key',self.qwen_key)
+        self.qwen_voice=QLineEdit(qwen.get('tts_voice') or 'Cherry');speech_form.addRow('千问音色',self.qwen_voice)
+        speech_form.addRow(QLabel('Edge 无需密钥；千问音色见官方音色表（Cherry / Serena / Ethan 等）。\n手动录音默认走千问识别，没配密钥时自动用本地 Vosk。'))
         preview=QPushButton('保存并试听');preview.clicked.connect(self.preview);speech_form.addRow(preview)
         tabs.addTab(speech,'语音输出')
         realtime=QWidget();rt=QVBoxLayout(realtime)
@@ -62,6 +67,11 @@ class DesktopConsole(QDialog):
         values=dict(driver_source=source,base_url=self.base.text().strip(),model=self.model.text().strip(),
             tts_provider=self.tts.currentData(),edge_voice=self.voice.text().strip() or 'zh-CN-XiaoyiNeural',
             edge_rate=self.rate.text().strip() or '+15%',edge_pitch=self.pitch.text().strip() or '+14Hz')
+        qwen=dict(self.raw.get('qwen_speech') or {})
+        if self.qwen_key.text().strip():qwen['api_key']=self.qwen_key.text().strip()
+        qwen['tts_voice']=self.qwen_voice.text().strip() or 'Cherry'
+        qwen.setdefault('enabled',True)
+        values['qwen_speech']=qwen
         if source=='dsh':values.update(api_key='',api_key_ref='')
         else:
             values['api_key_ref']=''
@@ -70,6 +80,10 @@ class DesktopConsole(QDialog):
         if not re.fullmatch(r'[+-]\d+%',values['edge_rate']):raise ValueError('语速请使用 +15% 或 -10% 这样的格式')
         if not re.fullmatch(r'[+-]\d+Hz',values['edge_pitch']):raise ValueError('音调请使用 +14Hz 或 -5Hz 这样的格式')
         if values['tts_provider']=='doubao' and not self.raw.get('doubao_tts_api_key'):raise ValueError('尚未配置豆包语音密钥；Edge TTS 无需此密钥')
+        if values['tts_provider']=='qianwen':
+            from core.qwen_speech import speech_settings
+            if not speech_settings(dict(self.raw,qwen_speech=qwen)).get('api_key'):
+                raise ValueError('千问语音需要 API Key：填在上面的输入框，或先在长语音里配好千问密钥')
         return values
 
     def save(self):

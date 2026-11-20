@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "reference_width": 245,
+  "canvas": [
+    320,
+    416
+  ],
+  "clips": {
+    "work": {
+      "frames": "work/frames",
+      "fps": 24.0,
+      "count": 241,
+      "duration": 10.041666666666666,
+      "loop": false,
+      "placement": {
+        "body_height": 303,
+        "ground_y": 408,
+        "head_top": 105,
+        "neck_y": 296,
+        "neck_fraction": 0.55,
+        "width_factor": 0.93
+      }
+    },
+    "walk": {
+      "frames": "walk/frames",
+      "fps": 24.0,
+      "count": 241,
+      "duration": 10.041666666666666,
+      "loop": false,
+      "placement": {
+        "body_height": 303,
+        "ground_y": 408
+      }
+    }
+  }
+}

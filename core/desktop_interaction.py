@@ -27,6 +27,9 @@ _BROWSER_ONLY = {'back', 'forward', 'refresh', 'next_tab', 'previous_tab',
                  'new_tab', 'address_bar'}
 _KEYS = {'enter': [13], 'escape': [27], 'esc': [27], 'tab': [9],
          'find': [17, 70], 'select_all': [17, 65]}
+_LOCAL_ACTIONS = {'fill', 'append', 'clear', 'fill_named', 'click', 'focus', 'click_index',
+                  'scroll_down', 'scroll_up', 'list_targets', 'list_options'}
+_SUPPORTED_ACTIONS = _BROWSER_ONLY | set(_KEYS) | _LOCAL_ACTIONS
 _GENERIC_INPUTS = {'输入框', '当前输入框', '这个输入框', '搜索框', '搜索输入框',
                    '搜索', '搜索输入', '当前', '这个', '输入'}
 _CLICK_TYPES = {'Button', 'Hyperlink', 'MenuItem', 'TabItem', 'ListItem',
@@ -494,144 +497,157 @@ class DesktopInteraction:
         if not self.lock.acquire(blocking=False):
             return finish(dict(ok=False, action_sent=False, code='desktop_busy', silent=False,
                                error='上一项界面操作尚未结束，本次未发送操作'))
-        attempted = False
-        is_list = False
+        flags = {'attempted': False, 'is_list': False}
         try:
-            generation=command.get('_step_generation',self._generation) if isinstance(command,dict) else self._generation
-            external_check=command.get('_can_execute') if isinstance(command,dict) else None
-            self._can_execute=lambda:self._generation==generation and (external_check is None or external_check())
-            if not self._can_execute():raise RuntimeError('这一步已取消，没有发送操作')
-            from core.desktop_access import DesktopAccess
-            if not DesktopAccess().enabled:
-                raise RuntimeError('完整访问未开启，本次未发送操作')
-            if not isinstance(command, dict):
-                raise ValueError('需要已解析的单步命令')
-            action = command.get('step_action') or command.get('browser_action')
-            is_list = action in ('list_targets', 'list_options')
-            if action == 'unsupported':
-                raise ValueError(command.get('error') or '不支持该本地单步操作，本次未发送操作')
-            if action not in (_BROWSER_ONLY | set(_KEYS) | {'fill', 'append', 'clear', 'fill_named',
-                              'click', 'focus', 'click_index', 'scroll_down', 'scroll_up',
-                              'list_targets', 'list_options'}):
-                raise ValueError('不支持该本地单步操作，本次未发送操作')
-            if action in ('fill', 'append', 'fill_named') and (
-                    _input_method_question(command.get('source_text', '')) or
-                    _unsafe_input(command.get('source_text', ''))):
-                raise ValueError('输入法问句或复合输入不是单步填写，本次未发送操作')
-            if command.get('kind') == 'browser':
-                activated = self._activate_browser()
-                if activated:
-                    hwnd = activated
-            identity = self._guard(hwnd)
+            action, identity = self._prepare(command, hwnd, flags)
             hwnd = identity['hwnd']
-            if is_list:
+            if flags['is_list']:
                 return finish(dict(self._list(identity), hwnd=hwnd))
+            from core.wechat_input_scope import require_wechat_input_scope
+            require_wechat_input_scope(hwnd)
+            if action in _BROWSER_ONLY:
+                return finish(self._browser_step(identity, action, command, hwnd, flags))
             verified = False
             source = 'uia'
-            if action in _BROWSER_ONLY:
-                if identity['process'] not in _BROWSERS:
-                    raise RuntimeError('该动作只适用于浏览器；当前是其他程序，未发送浏览器快捷键')
-                if self.browser is None:
-                    from core.browser_interaction import BrowserInteraction
-                    self.browser = BrowserInteraction()
-                self._recheck(identity)
-                attempted = True
-                result = self.browser.execute(dict(command, browser_action=action), hwnd=hwnd)
-                if not isinstance(result, dict):
-                    attempted = True
-                    raise RuntimeError('浏览器执行回执不明，请先核对，未自动重试')
-                result = dict(result, silent=bool(result.get('ok')), hwnd=hwnd)
-                return finish(result)
             if action in _KEYS:
                 self._recheck(identity)
-                attempted = True
+                flags['attempted'] = True
                 self._send_keys(_KEYS[action])
                 message = '已发送快捷键'
             elif action in ('scroll_down', 'scroll_up'):
                 self._recheck(identity)
-                attempted = True
+                flags['attempted'] = True
                 self._scroll(identity, action == 'scroll_down')
                 message = '已发送滚动'
             elif action in ('fill', 'append', 'clear', 'fill_named'):
-                if action == 'fill_named':
-                    item, _ = self._named(identity, command.get('target'), for_input=True)
-                    text = command.get('text')
-                else:
-                    item = self._element(self.uia.focused(hwnd), hwnd)
-                    if item.get('focused') is not True:
-                        raise RuntimeError('当前焦点不是目标输入框，未发送操作')
-                    text = '' if action == 'clear' else command.get('target')
-                self._usable(item, for_input=True)
-                if action != 'clear':
-                    literal = _payload(action, command.get('source_text', ''))
-                    if literal is not None:
-                        text = literal
-                if not isinstance(text, str):
-                    raise ValueError('输入内容必须为文字')
-                if action == 'append':
-                    if item.get('value_truncated') or not isinstance(item.get('value'), str):
-                        raise RuntimeError('无法完整回读原有内容，未执行追加输入')
-                    text = item['value'] + text
-                if len(text) > 4000:
-                    raise ValueError('输入内容超过4000字，本次未发送操作')
-                # A second focused read binds focus-only input; never select another edit.
-                if action != 'fill_named':
-                    current = self._element(self.uia.focused(hwnd), hwnd)
-                    if current['ref'] != item['ref'] or current.get('focused') is not True:
-                        raise RuntimeError('输入焦点已变化，未发送操作')
-                self._recheck(identity)
-                attempted = True
-                receipt = self.uia.act(hwnd, 'set_value', ref=item['ref'], value=text)
-                if not isinstance(receipt, dict) or receipt.get('verified') is not True or receipt.get('fallback'):
-                    raise RuntimeError('填写已尝试但回读未匹配，结果不确定；请先核对，未自动重试')
+                self._fill_step(identity, action, command, hwnd, flags)
                 verified = True
                 message = '已填写并回读确认'
             else:
-                if action == 'click_index':
-                    item, visual = self._indexed(command, identity)
-                else:
-                    item, visual = self._named(identity, command.get('target'))
-                if visual is not None:
-                    if action == 'focus':
-                        raise RuntimeError('视觉坐标无法确认输入焦点，未发送操作')
-                    rect = self._rect(visual.get('rect'), identity)
-                    self._validate_visual(identity, visual)
-                    attempted = True
-                    self._mouse_click(rect, identity)
-                    source = 'visual'
-                    message = '已点中画面里的目标；请看画面确认结果'
-                else:
-                    self._usable(item, for_input=action == 'focus')
-                    operation = 'focus' if action == 'focus' or item['type'] in ('Edit', 'ComboBox') else 'invoke'
-                    self._recheck(identity)
-                    attempted = True
-                    receipt = self.uia.act(hwnd, operation, ref=item['ref'])
-                    if not isinstance(receipt, dict):
-                        raise RuntimeError('UIA回执不明，请先核对，未自动重试')
-                    if receipt.get('fallback'):
-                        # This receipt explicitly means UIA has NOT sent an action.
-                        if operation != 'invoke' or receipt.get('input_sent') is not False:
-                            raise RuntimeError('UIA动作结果不确定，未发送第二次操作')
-                        attempted = False
-                        rect = self._rect(receipt.get('rect'), identity)
-                        self._recheck(identity)
-                        attempted = True
-                        self._mouse_click(rect, identity)
-                    elif receipt.get('input_sent') is not True and receipt.get('verified') is not True:
-                        raise RuntimeError('UIA未确认动作是否发送，结果不确定；请先核对，未自动重试')
-                    verified = receipt.get('verified') is True
-                    if operation == 'focus' and not verified:
-                        raise RuntimeError('聚焦已尝试但未确认，结果不确定；请先核对，未自动重试')
-                    message = '已选中输入框' if operation == 'focus' else '已点击；请看画面确认结果'
+                verified, source, message = self._pointer_step(identity, action, command, hwnd, flags)
             return finish(dict(ok=True, action_sent=True, verified=verified, source=source,
                                hwnd=hwnd, message=message, silent=True))
         except Exception as exc:
-            error=str(exc).replace('UIA','界面').replace('窗口指纹','窗口').replace('ref','按钮记录')
+            error = str(exc).replace('UIA', '界面').replace('窗口指纹', '窗口').replace('ref', '按钮记录')
             return finish(dict(ok=False, code='desktop_step_failed', silent=False,
-                               action_sent=None if attempted else False, error=error[:500]))
+                               action_sent=None if flags['attempted'] else False, error=error[:500]))
         finally:
             # Even a rejected/uncertain action consumes numbers; never reuse stale intent.
-            if not is_list:
+            if not flags['is_list']:
                 self._options = None
             self._can_execute = None
             self.lock.release()
+
+    def _prepare(self, command, hwnd, flags):
+        """Validate the step and resolve its window before any input is sent."""
+        generation = command.get('_step_generation', self._generation) if isinstance(command, dict) else self._generation
+        external_check = command.get('_can_execute') if isinstance(command, dict) else None
+        self._can_execute = lambda: self._generation == generation and (external_check is None or external_check())
+        if not self._can_execute():
+            raise RuntimeError('这一步已取消，没有发送操作')
+        from core.desktop_access import DesktopAccess
+        if not DesktopAccess().enabled:
+            raise RuntimeError('完整访问未开启，本次未发送操作')
+        if not isinstance(command, dict):
+            raise ValueError('需要已解析的单步命令')
+        action = command.get('step_action') or command.get('browser_action')
+        flags['is_list'] = action in ('list_targets', 'list_options')
+        if action == 'unsupported':
+            raise ValueError(command.get('error') or '不支持该本地单步操作，本次未发送操作')
+        if action not in _SUPPORTED_ACTIONS:
+            raise ValueError('不支持该本地单步操作，本次未发送操作')
+        if action in ('fill', 'append', 'fill_named') and (
+                _input_method_question(command.get('source_text', '')) or
+                _unsafe_input(command.get('source_text', ''))):
+            raise ValueError('输入法问句或复合输入不是单步填写，本次未发送操作')
+        if command.get('kind') == 'browser':
+            activated = self._activate_browser()
+            if activated:
+                hwnd = activated
+        return action, self._guard(hwnd)
+
+    def _browser_step(self, identity, action, command, hwnd, flags):
+        """Delegate a browser-only action to BrowserInteraction after a recheck."""
+        if identity['process'] not in _BROWSERS:
+            raise RuntimeError('该动作只适用于浏览器；当前是其他程序，未发送浏览器快捷键')
+        if self.browser is None:
+            from core.browser_interaction import BrowserInteraction
+            self.browser = BrowserInteraction()
+        self._recheck(identity)
+        flags['attempted'] = True
+        result = self.browser.execute(dict(command, browser_action=action), hwnd=hwnd)
+        if not isinstance(result, dict):
+            raise RuntimeError('浏览器执行回执不明，请先核对，未自动重试')
+        return dict(result, silent=bool(result.get('ok')), hwnd=hwnd)
+
+    def _fill_step(self, identity, action, command, hwnd, flags):
+        """Write text into the focused (or named) input and verify the readback."""
+        if action == 'fill_named':
+            item, _ = self._named(identity, command.get('target'), for_input=True)
+            text = command.get('text')
+        else:
+            item = self._element(self.uia.focused(hwnd), hwnd)
+            if item.get('focused') is not True:
+                raise RuntimeError('当前焦点不是目标输入框，未发送操作')
+            text = '' if action == 'clear' else command.get('target')
+        self._usable(item, for_input=True)
+        if action != 'clear':
+            literal = _payload(action, command.get('source_text', ''))
+            if literal is not None:
+                text = literal
+        if not isinstance(text, str):
+            raise ValueError('输入内容必须为文字')
+        if action == 'append':
+            if item.get('value_truncated') or not isinstance(item.get('value'), str):
+                raise RuntimeError('无法完整回读原有内容，未执行追加输入')
+            text = item['value'] + text
+        if len(text) > 4000:
+            raise ValueError('输入内容超过4000字，本次未发送操作')
+        # A second focused read binds focus-only input; never select another edit.
+        if action != 'fill_named':
+            current = self._element(self.uia.focused(hwnd), hwnd)
+            if current['ref'] != item['ref'] or current.get('focused') is not True:
+                raise RuntimeError('输入焦点已变化，未发送操作')
+        self._recheck(identity)
+        flags['attempted'] = True
+        receipt = self.uia.act(hwnd, 'set_value', ref=item['ref'], value=text)
+        if not isinstance(receipt, dict) or receipt.get('verified') is not True or receipt.get('fallback'):
+            raise RuntimeError('填写已尝试但回读未匹配，结果不确定；请先核对，未自动重试')
+
+    def _pointer_step(self, identity, action, command, hwnd, flags):
+        """Click or focus one element, with validated visual coordinates as fallback."""
+        if action == 'click_index':
+            item, visual = self._indexed(command, identity)
+        else:
+            item, visual = self._named(identity, command.get('target'))
+        source = 'uia'
+        if visual is not None:
+            if action == 'focus':
+                raise RuntimeError('视觉坐标无法确认输入焦点，未发送操作')
+            rect = self._rect(visual.get('rect'), identity)
+            self._validate_visual(identity, visual)
+            flags['attempted'] = True
+            self._mouse_click(rect, identity)
+            return False, 'visual', '已点中画面里的目标；请看画面确认结果'
+        self._usable(item, for_input=action == 'focus')
+        operation = 'focus' if action == 'focus' or item['type'] in ('Edit', 'ComboBox') else 'invoke'
+        self._recheck(identity)
+        flags['attempted'] = True
+        receipt = self.uia.act(hwnd, operation, ref=item['ref'])
+        if not isinstance(receipt, dict):
+            raise RuntimeError('UIA回执不明，请先核对，未自动重试')
+        if receipt.get('fallback'):
+            # This receipt explicitly means UIA has NOT sent an action.
+            if operation != 'invoke' or receipt.get('input_sent') is not False:
+                raise RuntimeError('UIA动作结果不确定，未发送第二次操作')
+            flags['attempted'] = False
+            rect = self._rect(receipt.get('rect'), identity)
+            self._recheck(identity)
+            flags['attempted'] = True
+            self._mouse_click(rect, identity)
+        elif receipt.get('input_sent') is not True and receipt.get('verified') is not True:
+            raise RuntimeError('UIA未确认动作是否发送，结果不确定；请先核对，未自动重试')
+        verified = receipt.get('verified') is True
+        if operation == 'focus' and not verified:
+            raise RuntimeError('聚焦已尝试但未确认，结果不确定；请先核对，未自动重试')
+        return verified, source, '已选中输入框' if operation == 'focus' else '已点击；请看画面确认结果'

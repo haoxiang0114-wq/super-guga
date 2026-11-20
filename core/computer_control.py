@@ -14,6 +14,20 @@ class _MI(ctypes.Structure):
 class _U(ctypes.Union):_fields_=[('ki',_KI),('mi',_MI)]
 class _INPUT(ctypes.Structure):_fields_=[('type',wintypes.DWORD),('value',_U)]
 
+def _send_input(count,pointer):
+    """调用 user32.SendInput；每次调用前重设本模块签名。
+
+    ctypes.windll.user32 是进程级共享的函数对象，argtypes 一旦被别处（自检、
+    后台鼠标传输）改过，这里再传 byref(_INPUT)/INPUT 数组就会抛
+    ArgumentError: expected LP_INPUT instance instead of pointer to _INPUT /
+    INPUT_Array_122（现场 20261110q 豆包第 1/2 步）。Win32 原型是
+    ``UINT SendInput(UINT, LPINPUT, int)``，第二参一律传指针。
+    """
+    user=ctypes.windll.user32
+    user.SendInput.argtypes=[wintypes.UINT,ctypes.POINTER(_INPUT),ctypes.c_int]
+    user.SendInput.restype=wintypes.UINT
+    return int(user.SendInput(count,pointer,ctypes.sizeof(_INPUT)))
+
 def _attach_focus(hwnd):
     """Windows foreground handoff, bounded to the requested existing window."""
     import win32gui,win32process,win32api
@@ -32,12 +46,30 @@ def _attach_focus(hwnd):
     finally:
         for thread in reversed(attached):user.AttachThreadInput(current,thread,False)
 
+def _foreground_target(hwnd):
+    """An active application's visible menu may keep its main window foreground."""
+    import win32gui,win32process
+    foreground=win32gui.GetForegroundWindow()
+    if int(hwnd)==foreground:return True
+    try:
+        if not foreground or not win32gui.IsWindowVisible(hwnd):return False
+        if not (win32gui.GetWindowLong(hwnd,-16)&0x80000000):return False  # WS_POPUP
+        target_thread,target_pid=win32process.GetWindowThreadProcessId(hwnd)
+        active_thread,active_pid=win32process.GetWindowThreadProcessId(foreground)
+        if not target_pid or (target_thread,target_pid)!=(active_thread,active_pid):return False
+        owner=win32gui.GetWindow(hwnd,4)  # GW_OWNER
+        if owner==foreground:return True
+        name=win32gui.GetClassName(hwnd)
+        return name=='#32768' or name.startswith('Qt') and 'QWindowPopup' in name
+    except Exception:return False
+
+
 def _send_keys(values):
     user=ctypes.windll.user32
     def send(code,up=False):
         extended=code in (33,34,35,36,37,38,39,40,45,46,91,92)
         packet=_INPUT(1,_U(ki=_KI(code,user.MapVirtualKeyW(code,0),int(extended)|(2 if up else 0),0,0)))
-        if user.SendInput(1,ctypes.byref(packet),ctypes.sizeof(_INPUT))!=1:raise RuntimeError('Windows拒绝快捷键输入')
+        if _send_input(1,ctypes.byref(packet))!=1:raise RuntimeError('Windows拒绝快捷键输入')
     try:
         for code in values:send(code)
     finally:
@@ -46,6 +78,10 @@ def _send_keys(values):
 
 def _key_values(keys):
     """Shared key-name resolver for hotkey and press."""
+    # 模型很爱把组合键写成 ["win","n"]；直接 str() 会变成 "['win', 'n']"，
+    # 一个键都解析不出来，于是报「不支持的组合键」。先把序列拼回 win+n。
+    if isinstance(keys,(list,tuple)):
+        keys='+'.join(str(k) for k in keys)
     parts=str(keys or '').lower().replace(' ','').split('+')
     aliases={'return':'enter','escape':'esc','control':'ctrl','control_l':'ctrl','control_r':'ctrl',
         'ctrl_l':'ctrl','alt_l':'alt','alt_r':'alt','shift_l':'shift','shift_r':'shift','super_l':'win','deleteforward':'delete',
@@ -96,7 +132,9 @@ class ComputerControl:
         if action=='press':
             # Models naturally say "press enter" to send a message. Treat it as a
             # single keystroke instead of rejecting it as an unknown screen action.
-            keys=str(args.get('keys') or args.get('key') or args.get('text') or 'enter').strip() or 'enter'
+            raw=args.get('keys') or args.get('key') or args.get('text') or ''
+            keys='+'.join(str(k) for k in raw) if isinstance(raw,(list,tuple)) else str(raw).strip()
+            keys=keys or 'enter'
             args=dict(args,action='hotkey',keys=keys)
             action='hotkey'
         supported=('windows','editor_context','focus','observe','accessibility','uia','uia_read','uia_wait',
@@ -135,6 +173,10 @@ class ComputerControl:
         if action=='focus':
             hwnd=int(args['hwnd'])
             if not win32gui.IsWindow(hwnd):raise ValueError('窗口已关闭，请重新列出')
+            if win32gui.GetForegroundWindow()!=hwnd and _foreground_target(hwnd):
+                self.observation=None
+                return dict(focused=False,popup_active=True,needs_observe=True,
+                    message='这是当前前台应用的可见菜单，不切换焦点；直接观察或调用菜单控件')
             win32gui.ShowWindow(hwnd,9)
             if win32gui.GetForegroundWindow()!=hwnd:
                 import pywintypes
@@ -142,6 +184,10 @@ class ComputerControl:
                 except pywintypes.error:
                     if win32gui.GetForegroundWindow()!=hwnd and not _attach_focus(hwnd):
                         raise RuntimeError('Windows未允许切换到目标窗口；尚未发送输入，请检查窗口状态或请用户聚焦目标窗口') from None
+                # Windows sometimes updates GetForegroundWindow after this call returns.
+                for _ in range(5):
+                    if win32gui.GetForegroundWindow()==hwnd:break
+                    if cancel.wait(.08):raise RuntimeError('窗口切换已停止，尚未发送输入')
             self.observation=None
             if win32gui.GetForegroundWindow()!=hwnd:raise RuntimeError('目标窗口尚未获得焦点；未发送输入')
             return dict(focused=True,needs_observe=True)
@@ -161,7 +207,7 @@ class ComputerControl:
                 frame=grab_window(hwnd)
             except Exception:
                 source='screen_grab'
-                if hwnd!=win32gui.GetForegroundWindow():
+                if not _foreground_target(hwnd):
                     raise ValueError('这个窗口无法自绘，且当前不在前台；请先 focus 再观察，避免截到别的窗口') from None
                 frame=ImageGrab.grab(bbox=rect,all_screens=True).convert('RGB')
             side=max(640,min(1600,int(args.get('max_side') or 1024)))
@@ -203,7 +249,9 @@ ConvertTo-Json -InputObject @($items) -Compress -Depth 3'''.replace('HWND_VALUE'
         if action=='uia':
             hwnd=int(args.get('hwnd') or win32gui.GetForegroundWindow())
             if not win32gui.IsWindow(hwnd):raise ValueError('窗口已关闭')
-            if win32gui.GetForegroundWindow()!=hwnd:raise ValueError('先 focus 目标窗口再执行控件操作')
+            if not _foreground_target(hwnd):raise ValueError('先 focus 目标窗口再执行控件操作')
+            from core.wechat_input_scope import require_wechat_input_scope
+            require_wechat_input_scope(hwnd)
             name=str(args.get('uia_name',''))[:200]
             automation_id=str(args.get('uia_id',''))[:200]
             control_type=str(args.get('uia_type',''))[:80]
@@ -217,6 +265,7 @@ ConvertTo-Json -InputObject @($items) -Compress -Depth 3'''.replace('HWND_VALUE'
                 if result.pop('fallback',False):
                     rect=result.pop('rect',None)
                     if not rect:raise RuntimeError('UIA控件没有可点击区域')
+                    user=ctypes.windll.user32
                     user.SetCursorPos(int((rect['left']+rect['right'])/2),int((rect['top']+rect['bottom'])/2))
                     user.mouse_event(2,0,0,0,0);user.mouse_event(4,0,0,0,0)
                     result['method']='MouseFallback';result['input_sent']=True
@@ -261,6 +310,7 @@ $r=$c.BoundingRectangle
             if operation=='click' or not result.get('performed'):
                 left,top,right,bottom=(float(result.get(k,0)) for k in ('left','top','right','bottom'))
                 if right<=left or bottom<=top:raise RuntimeError('UIA目标没有可点击区域')
+                user=ctypes.windll.user32
                 user.SetCursorPos(int((left+right)/2),int((top+bottom)/2))
                 user.mouse_event(2,0,0,0,0);user.mouse_event(4,0,0,0,0)
                 method='MouseFallback'
@@ -287,21 +337,26 @@ $r=$c.BoundingRectangle
             # A keystroke has no coordinates, so it must not depend on a live
             # screenshot id. Demanding one is what stranded the model at the
             # final "press send" step, which then reported an unknown action.
-            keys=str(args.get('keys') or args.get('key') or args.get('text') or '').strip()
+            raw=args.get('keys') or args.get('key') or args.get('text') or ''
+            keys='+'.join(str(k) for k in raw) if isinstance(raw,(list,tuple)) else str(raw).strip()
             if not keys:raise ValueError('按键需要 keys，例如 enter、esc、ctrl+a')
             values=_key_values(keys)
             hwnd=int(win32gui.GetForegroundWindow() or 0)
             if not hwnd:raise ValueError('没有前台窗口，按键未发送')
+            from core.wechat_input_scope import require_wechat_input_scope
+            require_wechat_input_scope(hwnd)
             _send_keys(values)
             return dict(input_sent=True,action='hotkey',keys=keys,needs_observe=True,
                 message='按键 '+keys+' 已发送；请 observe 核对结果，不要只凭按键判断成功')
         observed=self.observation
         if not observed or args.get('observation_id')!=observed['id'] or time.monotonic()-observed['time']>30:
             raise ValueError('观察 ID 已消耗或过期；先 observe 取得新 ID。若刚点击过输入框，只需用新 ID 执行 type，不要再次点击；也可一次 fill 完成定位与输入')
-        if win32gui.GetForegroundWindow()!=observed['hwnd'] or win32gui.GetWindowRect(observed['hwnd'])!=observed['rect']:
+        if not _foreground_target(observed['hwnd']) or win32gui.GetWindowRect(observed['hwnd'])!=observed['rect']:
             self.observation=None
             raise ValueError('前台窗口或位置已改变，先重新观察')
         self.observation=None
+        from core.wechat_input_scope import require_wechat_input_scope
+        require_wechat_input_scope(observed['hwnd'])
         def mapped(x,y):
             left,top,right,bottom=observed['rect']
             if args.get('coordinate_space','screenshot')=='screenshot':
@@ -372,25 +427,26 @@ $r=$c.BoundingRectangle
         elif action=='type':
             text=str(args.get('text',''))
             if len(text)>4000:raise ValueError('单次输入最多4000字')
-            if args.get('replace'):_send_keys([17,65])
-            if args.get('clear'):_send_keys([46])
+            if args.get('replace') or args.get('clear'):
+                # clear 单独只发一个 Delete，删的是光标后一个字符，并不清空；
+                # 且 Qt 控件会异步恢复上一次输入，Delete 打在空框上、旧文本随后
+                # 被恢复，粘贴就落在旧文本前面（实测得到“小军验收联系人”）。
+                # 先给应用留出聚焦/恢复的时间，全选后再留间隔删除。
+                cancel.wait(.12)
+                _send_keys([17,65]);cancel.wait(.12)
+                _send_keys([46]);cancel.wait(.12)
             if ('\n' in text or any(ord(c)>127 for c in text)) and self._paste_multiline(text,observed['hwnd'],cancel):
                 return dict(input_sent=True,action=action,needs_observe=True,message='多行文本已粘贴；请观察缩进并验证，剪贴板已恢复')
             # KEYEVENTF_UNICODE; preserves the user's clipboard.
-            class KI(ctypes.Structure):
-                _fields_=[('vk',wintypes.WORD),('scan',wintypes.WORD),('flags',wintypes.DWORD),('time',wintypes.DWORD),('extra',ctypes.c_size_t)]
-            class MI(ctypes.Structure):
-                _fields_=[('dx',wintypes.LONG),('dy',wintypes.LONG),('data',wintypes.DWORD),('flags',wintypes.DWORD),('time',wintypes.DWORD),('extra',ctypes.c_size_t)]
-            class U(ctypes.Union):_fields_=[('ki',KI),('mi',MI)]
-            class INPUT(ctypes.Structure):_fields_=[('type',wintypes.DWORD),('value',U)]
+            # The INPUT/_KI/_MI/_U structures are defined once at module scope.
             encoded=text.encode('utf-16-le')
             for offset in range(0,len(encoded),2):
                 if cancel.is_set():raise RuntimeError('文字输入已取消')
                 if win32gui.GetForegroundWindow()!=observed['hwnd']:
                     raise RuntimeError('打字期间前台窗口改变，已停止后续输入；部分文字可能已输入，请观察核对')
                 scan=int.from_bytes(encoded[offset:offset+2],'little')
-                inputs=(INPUT*2)(INPUT(1,U(ki=KI(0,scan,4,0,0))),INPUT(1,U(ki=KI(0,scan,6,0,0))))
-                if user.SendInput(2,inputs,ctypes.sizeof(INPUT))!=2:raise RuntimeError('Windows 拒绝输入；检查实际进程权限')
+                inputs=(_INPUT*2)(_INPUT(1,_U(ki=_KI(0,scan,4,0,0))),_INPUT(1,_U(ki=_KI(0,scan,6,0,0))))
+                if _send_input(2,ctypes.cast(inputs,ctypes.POINTER(_INPUT)))!=2:raise RuntimeError('Windows 拒绝输入；检查实际进程权限')
         else:raise ValueError('未知屏幕操作：'+str(requested_action or action)[:40]+
             '；支持 windows/editor_context/focus/observe/accessibility/uia/uia_read/uia_wait/click/double_click/move/drag/scroll/hotkey/press/type/fill')
         return dict(input_sent=True,action=requested_action,needs_observe=True,
@@ -424,3 +480,9 @@ $r=$c.BoundingRectangle
                     clip.EmptyClipboard()
                     for fmt,value in saved:clip.SetClipboardData(fmt,value)
             finally:clip.CloseClipboard()
+
+
+# ---- [teammate-merge] legacy compat re-exports (additive) ----
+from core.legacy_compat import (  # noqa: E402,F401
+    wheel_delta, wheel_notches, _ensure_foreground,
+)

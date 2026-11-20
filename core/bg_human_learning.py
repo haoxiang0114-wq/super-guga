@@ -1,7 +1,6 @@
 """Human-decision case memory and version-gated ranking weights."""
 import json,threading
 from pathlib import Path
-import numpy as np
 
 ROOT=Path(__file__).resolve().parents[1]
 CASES=ROOT/'data/bg_agent/human_learning_254477.json'

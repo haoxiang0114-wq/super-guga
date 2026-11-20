@@ -4,11 +4,11 @@ import ctypes
 import ctypes.wintypes
 import html
 import threading
-from PyQt5.QtCore import (Qt,QRect,QPoint,QBuffer,QIODevice,QObject,pyqtSignal,
+from PyQt5.QtCore import (Qt,QRect,QBuffer,QIODevice,QObject,pyqtSignal,
     QTimer,QAbstractNativeEventFilter)
 from PyQt5.QtGui import QPixmap,QPainter,QColor,QPen,QCursor
 from PyQt5.QtWidgets import (QApplication,QWidget,QDialog,QVBoxLayout,QHBoxLayout,
-    QLabel,QTextEdit,QTextBrowser,QLineEdit,QPushButton,QMenu,QComboBox)
+    QLabel,QTextEdit,QTextBrowser,QLineEdit,QPushButton,QComboBox)
 from core import screen_question
 
 
@@ -293,9 +293,10 @@ class ScreenTools(QObject,QAbstractNativeEventFilter):
         self._restore_panel=bool(panel and panel.isVisible());self._restore_popup=bool(self.popup and self.popup.isVisible())
         self._restore_pet=self.pet.isVisible()
         self._restore_bubble=self.pet._agent_bubble.isVisible()
-        launcher=getattr(self.pet,'_floating_launcher',None)
-        self._restore_launcher=bool(launcher and launcher.isVisible())
-        if launcher:launcher.hide()
+        experience=getattr(self.pet,'_experience',None)
+        surfaces=(getattr(experience,'quick_input',None),getattr(self.pet,'_desktop_console',None))
+        self._restore_surfaces=[widget for widget in surfaces if widget is not None and widget.isVisible()]
+        for widget in self._restore_surfaces:widget.hide()
         if panel:panel.hide()
         if self.popup:self.popup.hide()
         self.pet.hide();self.pet._agent_bubble.hide()
@@ -307,18 +308,20 @@ class ScreenTools(QObject,QAbstractNativeEventFilter):
         self._capture_pending=False
         try:
             if mode=='ask':
-                pixmap=self._snapshot_current()
+                image=image_uri(self._snapshot_current())
                 self._restore()
                 panel=self.pet._ensure_agent_panel()
-                if panel.busy:
-                    panel.attach_screenshot(image_uri(pixmap));panel.status.setText('当前任务执行中，截图已保留，任务结束后可发送');return
-                prompt=panel.editor.toPlainText().strip() or '请解释当前屏幕的内容，直接给出结论。'
-                panel.attach_screenshot(image_uri(pixmap));panel.show();panel.raise_()
-                panel.send(prompt)
+                panel.show();panel.raise_();panel.activateWindow()
+                panel.ask_screen(image)
                 return
             self.capture=RegionCapture();self.capture.selected.connect(lambda pix:self._selected(mode,pix));self.capture.cancelled.connect(self._cancel)
             self.capture.show();self.capture.raise_();self.capture.activateWindow()
-        except Exception as exc:self._cancel();self.pet._show_agent_bubble('截图未完成：'+str(exc))
+        except Exception as exc:
+            self._cancel()
+            if mode=='ask':
+                panel=self.pet._ensure_agent_panel()
+                panel.show();panel.raise_();panel.status_error('看屏幕未完成：'+str(exc))
+            else:self.pet._show_agent_bubble('截图未完成：'+str(exc))
 
     def _snapshot_current(self):
         pixmap=self._screen.grabWindow(0)
@@ -329,13 +332,13 @@ class ScreenTools(QObject,QAbstractNativeEventFilter):
         self.capture=None
         hidden=getattr(self.pet,'_desktop_hidden',False)
         if getattr(self,'_restore_pet',False) and not hidden:self.pet.show()
-        launcher=getattr(self.pet,'_floating_launcher',None)
-        if getattr(self,'_restore_launcher',False) and hidden and launcher:launcher.show()
         if not hidden and getattr(self,'_restore_pet',False) and getattr(self,'_restore_bubble',False):
             self.pet._agent_bubble.follow_pet();self.pet._agent_bubble.show()
         panel=getattr(self.pet,'_agent_panel',None)
         if getattr(self,'_restore_panel',False) and panel:panel.show()
         if getattr(self,'_restore_popup',False) and self.popup:self.popup.show()
+        for widget in getattr(self,'_restore_surfaces',[]):widget.show()
+        self._restore_surfaces=[]
 
     def _cancel(self):self._restore()
 
@@ -488,7 +491,7 @@ class ScreenTools(QObject,QAbstractNativeEventFilter):
             self._cached_selection=dict(payload)
             self.selection_verified.emit(dict(valid=True,sequence=sequence,payload=payload,
                                                point=point,auto=event.get('auto_explain',False)))
-        except Exception as exc:
+        except Exception:
             if payload.get('text'):
                 from ui.selection_snapshot import logical_point
                 self.selection_verified.emit(dict(valid=True,sequence=sequence,payload=payload,

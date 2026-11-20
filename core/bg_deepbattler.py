@@ -181,7 +181,7 @@ def model_pick(state, actions, metadata, config):
         body = response.json()
         reply = body if transport == 'endpoint' else json_reply(body['choices'][0]['message']['content'])
         selected = bind_first(reply, state, actions, context)
-    except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+    except (requests.RequestException, KeyError, TypeError, ValueError):
         raise RuntimeError('DeepBattler 决策连接或响应格式异常；未发送游戏输入') from None
     return dict(selected, provider='deepbattler_protocol', transport=transport,
                 model=config.get('model') if transport == 'existing_api' else 'endpoint_model',

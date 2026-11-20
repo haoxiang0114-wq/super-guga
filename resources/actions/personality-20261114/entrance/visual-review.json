@@ -1,0 +1,19 @@
+{
+  "status": "approved",
+  "reviewer": "Codex local visual and complete-frame geometry review",
+  "playback": "once",
+  "frames_sha256": "d0a1fc25a0d365912a1cac6e1cb58d19cd4b42dcceb51b59ccaf3ae1105f2187",
+  "checks": {
+    "continuous_motion": true,
+    "no_ghosts": true,
+    "anatomy": true,
+    "identity": true,
+    "entry_exit_transition": true,
+    "loop_seam": false
+  },
+  "scope": "Eight visual samples per action; all frame edges and consecutive silhouettes checked. Runtime acceptance tracked separately. Final lower-floor cleanup reviewed in the renderer preview.",
+  "geometry": {
+    "edge_clipped_frames": 0,
+    "min_consecutive_iou": 0.84697
+  }
+}

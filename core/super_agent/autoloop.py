@@ -87,7 +87,6 @@ class AutoLoop:
         started = time.monotonic()
         rounds = []
         reasons_seen = {}
-        last = None
         current_prompt = str(prompt or '')
         current_session = str(session_id or '')
 
@@ -152,7 +151,6 @@ class AutoLoop:
                 return self._report(goal, rounds, 'no_progress',
                                     '同一个失败原因连续出现 %d 次，停手交给人' % reasons_seen[key])
 
-            last = verdict
             current_prompt = self._follow_up(verdict)
 
         return self._report(goal, rounds, 'rounds_exhausted',

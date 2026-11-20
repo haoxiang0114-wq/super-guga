@@ -7,8 +7,7 @@ import math
 import time
 from collections import deque
 
-from PyQt5.QtCore import QObject, QPoint, QTimer
-from PyQt5.QtGui import QGuiApplication
+from PyQt5.QtCore import QObject, QTimer
 
 
 def squash_scale(progress, amount=.90):
@@ -57,6 +56,7 @@ class DesktopPetPhysics(QObject):
     def stop(self):
         self.timer.stop()
         self.mode = None
+        if hasattr(self.animator,'set_walking'):self.animator.set_walking(False)
 
     def press(self, point):
         self.stop()
@@ -78,15 +78,20 @@ class DesktopPetPhysics(QObject):
         return False
 
     def walk(self, dx, seconds=10., lead=2., tail=2.):
-        if self.mode or not self.window.isVisible():
+        if (self.mode or not self.window.isVisible() or self.animator._idle_motion_blocked()
+                or self.animator.active_clip not in (None,'idle') or 'personality:walk' not in self.animator.clips):
             return False
         self.start_x, self.start_y = self.window.x(), self.window.y()
         area = self.window.screen().availableGeometry()
         target = max(area.left(), min(self.start_x+dx, area.right()-self.window.width()+1))
         self.distance = target-self.start_x
-        self.seconds, self.lead, self.tail = seconds, lead, tail
+        if abs(self.distance)<2:return False
+        clip=self.animator.clips['personality:walk']
+        self.seconds=len(clip['frames'])/clip['fps']
+        self.lead,self.tail=.25,.25
         self.mode = 'walk'
         self.started = self.last = time.monotonic()
+        if hasattr(self.animator,'set_walking'):self.animator.set_walking(True,self.distance)
         self.timer.start()
         return True
 
@@ -95,7 +100,12 @@ class DesktopPetPhysics(QObject):
         dt = min(.05, max(0., now-self.last))
         self.last = now
         if self.mode == 'walk':
+            if (not self.window.isVisible() or self.animator._being_dragged or
+                    self.animator._task_motion.active or self.animator._speaking or self.animator._music_stage_active):
+                self._finish();return
             u = max(0., min(1., (now-self.started-self.lead)/max(.1, self.seconds-self.lead-self.tail)))
+            # Smooth acceleration/deceleration instead of a constant-speed slide.
+            u=u*u*(3-2*u)
             self.window.move(round(self.start_x+self.distance*u), self.start_y)
             if now-self.started >= self.seconds:
                 self._finish()

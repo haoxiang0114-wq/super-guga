@@ -10,7 +10,6 @@
 来源：队友仓库 `guga-desktop/agent/preflight.py` 的"教训固化成检查"做法。
 """
 import importlib
-import re
 import sys
 from pathlib import Path
 

@@ -8,9 +8,15 @@ from PyQt5.QtCore import Qt, QTimer, QRectF
 from PyQt5.QtGui import QPainter, QColor, QPen, QPixmap, QFont
 from PyQt5.QtWidgets import (QDialog, QFormLayout, QVBoxLayout, QHBoxLayout,
     QLineEdit, QComboBox, QCheckBox, QSpinBox, QPushButton, QLabel,
-    QDialogButtonBox, QMessageBox, QPlainTextEdit, QWidget, QFrame, QScrollArea,
-    QSizePolicy)
-from core.realtime_voice import CONFIG_PATH, DEFAULTS, connection_url, load_settings
+    QDialogButtonBox, QMessageBox, QWidget, QFrame, QScrollArea)
+from core.realtime_voice import (
+    CONFIG_PATH, DEFAULTS, SEED_MODEL, SEED_PROVIDER, SEED_URL, SEED_VOICE,
+    connection_url, load_settings, with_environment_credentials,
+)
+
+
+QWEN_MODELS = ('qwen-audio-3.1-realtime-plus', 'qwen3.8-omni-flash-realtime',
+               'qwen3.5-omni-plus-realtime', 'qwen3.5-omni-flash-realtime')
 
 
 class VoiceSettingsDialog(QDialog):
@@ -24,8 +30,11 @@ class VoiceSettingsDialog(QDialog):
         except FileNotFoundError:
             self._config = {}
         cfg = dict(DEFAULTS, **self._config.get('realtime_voice', {}))
+        self._active_provider = cfg['provider']
+        self._profiles = dict(self._config.get('realtime_voice_profiles', {}))
+        self._profiles[self._active_provider] = cfg
         layout = QVBoxLayout(self)
-        note = QLabel('千问 AI 平台只需 API Key，无需业务空间 ID。\nKey只保存到本机 ai_config.json，已由Git忽略。')
+        note = QLabel('各平台使用独立的 API Key 和模型设置。Key 只保存在本机。')
         note.setWordWrap(True)
         layout.addWidget(note)
         self.link = QLabel()
@@ -36,6 +45,8 @@ class VoiceSettingsDialog(QDialog):
         self.provider = QComboBox()
         self.provider.addItem('千问 AI 平台（platform.qianwenai.com）', 'qianwen')
         self.provider.addItem('阿里云百炼', 'bailian')
+        self.provider.addItem('火山引擎 · 豆包 Seed Realtime', SEED_PROVIDER)
+        self.provider.addItem('自定义 · 兼容千问实时协议', 'custom')
         self.provider.setCurrentIndex(max(0, self.provider.findData(cfg.get('provider', 'qianwen'))))
         form.addRow('API 平台', self.provider)
         # The two platforms sell the same model names but are separate gateways
@@ -45,6 +56,10 @@ class VoiceSettingsDialog(QDialog):
         self.endpoint.setWordWrap(True)
         self.endpoint.setStyleSheet('color:#5a6b7a;')
         form.addRow('实际连接', self.endpoint)
+        self.url_label = QLabel('WebSocket 地址')
+        self.url = QLineEdit(cfg.get('ws_url', ''))
+        self.url.setPlaceholderText('wss://服务商域名/实时语音路径')
+        form.addRow(self.url_label, self.url)
         self.key = QLineEdit(cfg.get('api_key', ''))
         self.key.setEchoMode(QLineEdit.Password)
         self.key.setPlaceholderText('所选平台的 API Key；也可用 DASHSCOPE_API_KEY 环境变量')
@@ -60,8 +75,7 @@ class VoiceSettingsDialog(QDialog):
         self.region_label = QLabel('地域')
         form.addRow(self.region_label, self.region)
         self.model = QComboBox()
-        self.model.addItems(['qwen-audio-3.1-realtime-plus', 'qwen3.8-omni-flash-realtime', 'qwen3.5-omni-plus-realtime',
-                             'qwen3.5-omni-flash-realtime'])
+        self.model.addItems(QWEN_MODELS)
         self.model.setCurrentText(cfg['model'])
         form.addRow('实时语音模型', self.model)
         self.voice = QComboBox()
@@ -74,11 +88,11 @@ class VoiceSettingsDialog(QDialog):
                                    cfg.get('free_quota_confirmed_provider') == self.provider.currentData())
         form.addRow('只用赠送额度', self.free_guard)
         self.model.currentTextChanged.connect(lambda _: self.free_guard.setChecked(False))
-        self.model.currentTextChanged.connect(lambda model: self.voice.setCurrentText(
-            'longanqian_v3.1' if model.startswith('qwen-audio-') else 'Tina'))
-        quota_note = QLabel('千问首页 → 查看权益 → 当前模型 → 免费额度用尽即停。\n未认证账号默认启用；已认证账号需手动开启。未确认时阻止联网。')
-        quota_note.setWordWrap(True)
-        layout.addWidget(quota_note)
+        self.model.currentTextChanged.connect(self._model_changed)
+        self.key.textChanged.connect(lambda _: self.free_guard.setChecked(False))
+        self.quota_note = QLabel()
+        self.quota_note.setWordWrap(True)
+        layout.addWidget(self.quota_note)
         self.headphones = QCheckBox('使用耳机：允许边听边说和语音打断')
         self.headphones.setChecked(cfg['headphones'])
         form.addRow('收音模式', self.headphones)
@@ -134,19 +148,59 @@ class VoiceSettingsDialog(QDialog):
         layout.addWidget(buttons)
         self.provider.currentIndexChanged.connect(self._provider_changed)
         self.workspace.textChanged.connect(lambda _text: self._update_provider_fields())
-        self._update_provider_fields()
+        self.url.textChanged.connect(lambda _text: self.free_guard.setChecked(False))
+        self._load_provider(cfg)
 
     def _provider_changed(self):
-        self.free_guard.setChecked(False)
-        # A key from one platform must never be sent to another by switching UI.
-        self.key.clear()
-        # The workspace id is a 百炼-only identifier; keeping it across a switch is
-        # how a "qianwen key + bailian workspace" hybrid config gets saved.
-        self.workspace.clear()
+        self._profiles[self._active_provider] = self._provider_fields(self._active_provider)
+        self._active_provider = self.provider.currentData()
+        self._load_provider(self._profiles.get(self._active_provider, {}))
+
+    def _model_changed(self, model):
+        if self.provider.currentData() in ('qianwen', 'bailian'):
+            self.voice.setCurrentText('longanqian_v3.1' if model.startswith('qwen-audio-') else 'Tina')
+
+    def _load_provider(self, cfg):
+        provider = self.provider.currentData()
+        seed = provider == SEED_PROVIDER
+        custom = provider == 'custom'
+        self.model.clear()
+        self.model.setEditable(custom)
+        if not custom:
+            self.model.addItems([SEED_MODEL] if seed else QWEN_MODELS)
+        self.model.setCurrentText(cfg.get('model', SEED_MODEL if seed else '' if custom else QWEN_MODELS[0]))
+        self.key.setText(cfg.get('api_key', ''))
+        self.workspace.setText(cfg.get('workspace_id', ''))
+        self.url.setText(cfg.get('ws_url', ''))
+        self.region.setCurrentIndex(max(0, self.region.findData(cfg.get('region', 'cn-beijing'))))
+        self.voice.clear()
+        if seed:
+            self.voice.addItem(SEED_VOICE)
+        elif not custom:
+            self.voice.addItems(['longanqian_v3.1', 'Tina', 'Cici', 'Momo', 'Serena', 'Ethan'])
+        self.voice.setCurrentText(cfg.get('voice', SEED_VOICE if seed else 'Tina' if custom else self.voice.currentText()))
+        self.free_guard.setChecked(bool(cfg.get('free_quota_confirmed_model') == self.model.currentText()
+            and cfg.get('free_quota_confirmed_provider') == provider))
         self._update_provider_fields()
 
+    def _provider_fields(self, provider):
+        model = self.model.currentText().strip()
+        return dict(provider=provider, api_key=self.key.text().strip(), model=model,
+            workspace_id=self.workspace.text().strip() if provider == 'bailian' else '',
+            ws_url=self.url.text().strip() if provider == 'custom' else '',
+            region=self.region.currentData(), voice=self.voice.currentText().strip(),
+            free_quota_confirmed_model=model if self.free_guard.isChecked() else '',
+            free_quota_confirmed_provider=provider if self.free_guard.isChecked() else '')
+
     def _update_provider_fields(self):
-        bailian = self.provider.currentData() == 'bailian'
+        provider = self.provider.currentData()
+        bailian = provider == 'bailian'
+        self.url_label.setVisible(provider == 'custom')
+        self.url.setVisible(provider == 'custom')
+        self.endpoint.setVisible(provider != 'custom')
+        self.link.setVisible(provider != 'custom')
+        self.key.setPlaceholderText('填写当前平台签发的 API Key')
+        self.quota_note.setText('确认所选模型启用免费额度用尽即停后，勾选上方设置。')
         for field in (self.workspace, self.workspace_label, self.region, self.region_label):
             field.setVisible(bailian)
         if bailian:
@@ -155,36 +209,39 @@ class VoiceSettingsDialog(QDialog):
             region = self.region.currentData() or 'cn-beijing'
             host = (workspace + '.' + str(region) + '.maas.aliyuncs.com') if workspace else '需先填写业务空间 ID'
             self.endpoint.setText('wss://' + host + '  ·  阿里云百炼（用百炼的 Key，额度和账号在百炼控制台）')
-        else:
+        elif provider == SEED_PROVIDER:
+            self.link.setText('<a href="https://docs.volcengine.com/docs/doubao-voice/seedrealtime?lang=zh">豆包语音接入文档</a>')
+            self.endpoint.setText(SEED_URL)
+            self.key.setPlaceholderText('豆包语音控制台 → API Key 管理')
+            self.quota_note.setText('请在豆包语音控制台确认实时音视频通话仍处于试用状态、有剩余额度，且没有启用后付费。')
+        elif provider == 'qianwen':
             self.link.setText('<a href="https://platform.qianwenai.com/">千问 AI 平台</a> · '
                               '<a href="https://platform.qianwenai.com/docs/resources/free-quota">免费额度说明</a>')
             self.endpoint.setText('wss://maas.qianwenaiapi.com  ·  千问 AI 平台（只需 Key，不需要业务空间）')
 
     def _save(self):
         provider = self.provider.currentData()
-        # 千问 never uses a workspace id; a leftover one would only mislead the
-        # next person reading ai_config.json.
-        workspace = self.workspace.text().strip() if provider == 'bailian' else ''
-        cfg = dict(DEFAULTS, provider=provider, api_key=self.key.text().strip(), workspace_id=workspace,
-                   region=self.region.currentData(), model=self.model.currentText(),
-                   voice=self.voice.currentText().strip(), headphones=self.headphones.isChecked(),
+        fields = self._provider_fields(provider)
+        cfg = dict(DEFAULTS, **fields)
+        cfg.update(headphones=self.headphones.isChecked(),
                    silence_duration_ms=self.silence.value(),turn_mode=self.turn_mode.currentData(), max_call_minutes=self.duration.value(),
                    idle_minutes=self.idle.value(), input_device=self.input_device.currentData(),
                    output_device=self.output_device.currentData(), free_only=True,
                    owner_only=self.owner_only.isChecked(),
-                   free_quota_confirmed_model=self.model.currentText() if self.free_guard.isChecked() else '',
-                   free_quota_confirmed_provider=self.provider.currentData() if self.free_guard.isChecked() else '')
+                   owner_threshold=self._config.get('realtime_voice', {}).get('owner_threshold'))
         try:
-            checked = dict(cfg)
-            checked['api_key'] = checked['api_key'] or os.getenv('DASHSCOPE_API_KEY', '')
-            checked['workspace_id'] = checked['workspace_id'] or os.getenv('DASHSCOPE_WORKSPACE_ID', '')
-            connection_url(checked)
+            connection_url(with_environment_credentials(cfg))
             # Re-read immediately before save to preserve unrelated current configuration.
             try:
                 with CONFIG_PATH.open(encoding='utf-8-sig') as f:
                     current = json.load(f)
             except FileNotFoundError:
                 current = {}
+            previous = current.get('realtime_voice', {})
+            profiles = current.setdefault('realtime_voice_profiles', {})
+            if previous.get('provider') != provider and previous.get('provider'):
+                profiles[previous['provider']] = previous
+            profiles[provider] = fields
             current['realtime_voice'] = cfg
             tmp = CONFIG_PATH.with_suffix('.json.tmp')
             tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -447,7 +504,7 @@ class VoiceCallDialog(QDialog):
         end.clicked.connect(self.close)
         row.addWidget(end)
         layout.addLayout(row)
-        footer = QLabel('普通互动仍用原来的 Edge TTS  ·  仅本窗口使用千问语音\n账号剩余额度以平台权益页为准；关闭窗口即停止收音。')
+        footer = QLabel('普通互动仍用原来的 Edge TTS  ·  仅本窗口使用实时语音\n账号剩余额度以平台权益页为准；关闭窗口即停止收音。')
         footer.setObjectName('Subtle')
         footer.setAlignment(Qt.AlignCenter)
         footer.setWordWrap(True)

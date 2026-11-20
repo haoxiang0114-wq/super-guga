@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "reference_width": 245,
+  "canvas": [
+    320,
+    416
+  ],
+  "clips": {
+    "entrance": {
+      "frames": "entrance/frames",
+      "fps": 24.0,
+      "count": 144,
+      "loop": false,
+      "duration": 6.0,
+      "placement": {
+        "body_height": 303,
+        "ground_y": 408
+      }
+    },
+    "poke": {
+      "frames": "poke/frames",
+      "fps": 24.0,
+      "count": 197,
+      "loop": false,
+      "duration": 8.208333333333334,
+      "placement": {
+        "body_height": 303,
+        "ground_y": 408
+      }
+    },
+    "sing": {
+      "frames": "sing/frames",
+      "fps": 24.0,
+      "count": 241,
+      "loop": true,
+      "duration": 10.041666666666666,
+      "placement": {
+        "body_height": 303,
+        "ground_y": 408
+      }
+    }
+  }
+}

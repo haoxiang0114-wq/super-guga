@@ -28,7 +28,6 @@ def _get_extractor(model_path=MODEL_PATH):
 
 
 def _embedding(samples,model_path=MODEL_PATH):
-    import onnxruntime as ort
     import kaldi_native_fbank as knf
     model=_get_extractor(model_path)
     samples=np.asarray(samples,dtype=np.float32).reshape(-1)
@@ -159,7 +158,7 @@ def enroll(samples):
 class SpeakerGate:
     """Isolate ONNX Runtime from Qt/pythonnet while preserving a synchronous audio stream."""
     def __init__(self,profile_path=PROFILE_PATH,model_path=MODEL_PATH,threshold=None,emit=None):
-        import base64,queue,subprocess,sys
+        import queue,subprocess,sys
         self.emit=emit or (lambda data:None);self.state='listening';self.last_score=0.;self._closed=False
         self.error='';self.stats={};self._max_queue=0
         worker=ROOT/'tools/speaker_worker.py'

@@ -1,0 +1,19 @@
+{
+  "status": "approved",
+  "reviewer": "Codex local source/contact-sheet review and all-frame silhouette checks",
+  "playback": "once",
+  "frames_sha256": "2a47d2fa613ec7be15563c76d2cd584c87a9cf34a7c301022d78b905078e2beb",
+  "checks": {
+    "continuous_motion": true,
+    "no_ghosts": true,
+    "anatomy": true,
+    "identity": true,
+    "entry_exit_transition": true,
+    "loop_seam": false
+  },
+  "scope": "Eight visual samples per source and keyed clip; all 241 frame edges and consecutive silhouettes checked. Finite playback with crossfade, no loop claim. Runtime verification separate.",
+  "geometry": {
+    "edge_clipped_frames": 0,
+    "min_consecutive_iou": 0.94752
+  }
+}

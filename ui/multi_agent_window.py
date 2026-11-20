@@ -1,8 +1,8 @@
 """Lightweight companion Guga windows and the council controller."""
 import time
 from pathlib import Path
-from PyQt5.QtCore import QObject,QPoint,QSettings,Qt,pyqtSignal
-from PyQt5.QtGui import QColor,QFont,QPainter,QPen,QCursor
+from PyQt5.QtCore import QObject,QPoint,Qt,pyqtSignal
+from PyQt5.QtGui import QColor,QFont,QPainter,QCursor
 from ui.attention_preview import AttentionPreview
 from PyQt5.QtWidgets import QInputDialog,QMenu,QWidget
 
@@ -163,10 +163,10 @@ class CompanionWindow(QWidget):
         team.addAction('召唤 003 · Dora').triggered.connect(lambda:self.owner._multi_agent.summon('003'))
         team.addAction('同时召唤大肥鱼和 Dora').triggered.connect(self.owner._multi_agent.summon_pair)
         team.addAction('让团队讨论…').triggered.connect(lambda:self.owner._multi_agent.start_discussion((self.agent_id,'001')))
-        menu.addAction('截图分析').triggered.connect(lambda:self._with_identity(lambda:self.owner._screen_tools.begin('ask')))
+        menu.addAction('看屏幕').triggered.connect(lambda:self._with_identity(lambda:self.owner._screen_tools.begin('ask')))
         menu.addAction('解释').triggered.connect(lambda:self._with_identity(lambda:self.owner._screen_tools.begin('explain')))
         menu.addAction(self.profile['display_name']+'大小…').triggered.connect(self.show_size_dialog)
-        stage=menu.addMenu('🎵 音乐与动作')
+        stage=menu.addMenu('动作与表情')
         if hasattr(self.anim,'pools'):
             original=stage.addMenu('大肥鱼原版动画')
             for category in self.anim.pools['categories']:
@@ -185,9 +185,6 @@ class CompanionWindow(QWidget):
         self._menu_sunglasses.triggered.connect(lambda:self.anim.trigger_action('remove_sunglasses' if self.anim.sunglasses else 'sunglasses'))
         self._menu_dance=stage.addAction('开心摆鳍舞')
         self._menu_dance.triggered.connect(lambda:self.anim.trigger_action('stop_dance' if self.anim.dancing else 'dance'))
-        for label,command in (('唱《晴天》','唱晴天'),('暂停唱歌，聊一会儿','暂停唱歌'),('继续唱歌','继续唱歌')):
-            stage.addAction(label).triggered.connect(lambda checked=False,c=command:self._with_identity(lambda:self.owner._ensure_agent_panel().send(c)))
-        stage.addAction('停止唱歌').triggered.connect(lambda:self.owner._ensure_agent_panel().runtime.music.stop())
         if self.agent_id=='003':stage.addAction('🍊 吃橘子').triggered.connect(lambda:self.choose_expression('eating'))
         settings=menu.addMenu('🎙 声音与人格')
         settings.addAction('独立声音设置…').triggered.connect(lambda:self.owner._multi_agent.configure_voice(self.agent_id))
@@ -197,7 +194,7 @@ class CompanionWindow(QWidget):
         settings.addAction('查看长期记忆摘要').triggered.connect(lambda:self.owner._multi_agent.show_memory(self.agent_id))
         battle.addAction('📋 日志分析').triggered.connect(lambda:self._with_identity(self.owner._review_bg_logs))
         battle.addAction('🎮 战局分析 / 实战操作').triggered.connect(lambda:self._with_identity(self.owner._open_bg_live))
-        menu.addSeparator();menu.addAction('收起 '+self.profile['display_name']).triggered.connect(self.close_companion)
+        menu.addSeparator();self.owner._multi_agent.add_desktop_actions(menu)
         menu.ensurePolished();menu.adjustSize();menu.winId();return menu
 
     def contextMenuEvent(self,event):
@@ -245,6 +242,25 @@ class MultiAgentManager(QObject):
 
     def summon_pair(self):
         self.summon('002');self.summon('003')
+
+    def add_desktop_actions(self, menu):
+        for agent_id, name in (('002', '大肥鱼'), ('003', 'Dora')):
+            action = menu.addAction(name)
+
+            def refresh(ident=agent_id, label=name, item=action):
+                window = self.companions.get(ident)
+                item.setText(('退出 ' if window is not None and window.isVisible() else '唤醒 ') + label)
+
+            def toggle(checked=False, ident=agent_id):
+                window = self.companions.get(ident)
+                if window is not None and window.isVisible():
+                    window.close_companion()
+                else:
+                    self.summon(ident)
+
+            menu.aboutToShow.connect(refresh)
+            action.triggered.connect(toggle)
+            refresh()
 
     def _hidden(self,agent_id):self.companions.pop(str(agent_id),None)
 

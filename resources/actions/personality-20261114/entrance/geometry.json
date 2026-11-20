@@ -1,0 +1,30 @@
+{
+  "name": "entrance",
+  "source": "G:\\下载文件\\豆包画图 (3).mp4",
+  "source_sha256": "963521642781512288536975ac8c3325ee1c4a53341f6838b636f111dc2ca0a2",
+  "frames": 144,
+  "native_fps": 24.0,
+  "source_start": 0.0,
+  "source_end": 5.958333333333333,
+  "canvas": [
+    320,
+    416
+  ],
+  "reference_width": 245,
+  "baseline": 408,
+  "body_height": 304.36,
+  "edge_clipped_frames": 0,
+  "model": "u2netp-local",
+  "source_pixels_preserved": true,
+  "interpolation": false,
+  "video_audio_used": false,
+  "seconds": 36.45,
+  "review": "approved",
+  "cached_candidate": "runtime\\ui-personality-20261114\\candidates-v2\\entrance",
+  "source_frame_offset": 0,
+  "floor_cleanup_pixels": 6137,
+  "final_floor_cleanup_band": [
+    400,
+    416
+  ]
+}

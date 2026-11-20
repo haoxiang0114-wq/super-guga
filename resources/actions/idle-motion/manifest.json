@@ -5,25 +5,41 @@
       "name": "doze",
       "frames": "doze/frames",
       "native_fps": 24.0,
-      "weight": 0.8
+      "weight": 0.8,
+      "placement": {
+        "body_height": 324,
+        "ground_y": 347
+      }
     },
     {
       "name": "heart",
       "frames": "heart/frames",
       "native_fps": 24.0,
-      "weight": 1.0
+      "weight": 1.0,
+      "placement": {
+        "body_height": 324,
+        "ground_y": 347
+      }
     },
     {
       "name": "pout",
       "frames": "pout/frames",
       "native_fps": 24.0,
-      "weight": 1.0
+      "weight": 1.0,
+      "placement": {
+        "body_height": 302,
+        "ground_y": 348
+      }
     },
     {
       "name": "laugh",
       "frames": "laugh/frames",
       "native_fps": 24.0,
-      "weight": 1.0
+      "weight": 1.0,
+      "placement": {
+        "body_height": 290,
+        "ground_y": 349
+      }
     }
   ],
   "note": "自然待机动作；仅已审核原生24fps单次片段。语音、拖拽、任务、唱歌与显式表情优先。"

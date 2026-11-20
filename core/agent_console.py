@@ -61,6 +61,8 @@ def tool_catalog(limit=28):
         params = function.get('parameters') or {}
         props = params.get('properties') or {}
         required = params.get('required') or []
+        actions=(props.get('action') or {}).get('enum')
+        if actions:description += '；action仅可选：'+', '.join(str(x) for x in actions)
         if props:
             names = [str(key) + ('' if key in required else '?') for key in list(props)[:6]]
             description += '（参数：%s）' % ', '.join(names)
@@ -78,6 +80,7 @@ def system_prompt():
         '- 工具返回 ok=false 时如实说明原因；不可逆操作（发送、提交、删除）失败不得自动重发。\n'
         '- 多步任务按顺序做，每步拿到回执再继续；做不到就明确说卡在第几步、哪个工具、报什么错。\n'
         '- 打开网站（例如 B站、知乎）用 browser 工具并给网址，不要当成本机软件去 applications 里找。\n'
+        '- 所有网页步骤沿用用户当前默认浏览器的同一窗口和登录状态，browser.session_start也是绑定当前窗口。不得另开Chrome测试浏览器或用ego重试。用户说在网页里点击投稿，就按页面控件点击，不改成另一条打开网址的任务。\n'
         '- 完成后用一句自然中文给结论，不输出隐藏思维链。\n'
         '可用工具：\n' + tool_catalog())
 
@@ -117,6 +120,8 @@ class GugaTool:
             output_type = 'string'
 
             def forward(self, tool_name: str, arguments_json) -> str:
+                if cancel.is_set():
+                    return json.dumps({'ok': False, 'error': '本轮已停止，没有发送操作'}, ensure_ascii=False)
                 name = str(tool_name or '').strip()
                 if not name:
                     return json.dumps({'ok': False, 'error': '缺少 tool_name'}, ensure_ascii=False)
@@ -219,6 +224,16 @@ def _strip_inline_images(value, depth=0):
     return value
 
 
+class _AgentDone(Exception):
+    """工具已经明确说「这件事做完了」，立刻收工。
+
+    2026-11-12：主人反复抱怨「明明打开了，它还一遍遍重开」。实测日志：
+    browser open 成功返回后，模型仍然继续 ctrl+r、session_start、再 open 一次，
+    直到步数烧光或主人点停止。靠提示词让它「相信自己做完了」不可靠——
+    所以改成机制：哪个工具返回 task_complete=true，这一轮就当场结束。
+    """
+
+
 class _AgentAborted(Exception):
     """主动中断：连续失败时不再让模型继续换工具乱试。
 
@@ -274,10 +289,10 @@ def _find_image_url(result, depth=0):
 
 def _safe_json(value, depth=0):
     """把工具回执转成可 JSON 化的普通结构：限深 + 限宽，容忍循环引用。"""
-    if depth >= 5:
-        return str(value)[:200]
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if depth >= 5:
+        return str(value)[:200]
     if isinstance(value, dict):
         return {str(key): _safe_json(item, depth + 1) for key, item in list(value.items())[:100]}
     if isinstance(value, (list, tuple, set)):
@@ -374,6 +389,8 @@ class ConsoleAgent:
         # 最近几次工具调用的结果，用来判断"是不是在原地打转"。
         self.last_calls = []
         self.abort_reason = ''
+        self.done_note = ''
+        self.prompt = ''
         self._call_hook = on_call
         self.on_event = None
         http_kwargs = _client_kwargs(cfg, self.session_id)
@@ -402,7 +419,8 @@ class ConsoleAgent:
         try:
             ok = True
             if isinstance(result, dict):
-                ok = result.get('ok') is not False
+                from core.task_receipts import succeeded
+                ok = succeeded(result)
             self.last_calls.append(dict(name=str(name), action=str((args or {}).get('action') or ''),
                                         ok=bool(ok)))
             del self.last_calls[:-8]
@@ -413,6 +431,19 @@ class ConsoleAgent:
                 self._call_hook(name, args, result)
             except Exception:
                 pass
+        # 工具说「这件事做完了」就记下来，等 _record_step 当场收工。
+        # 不在这里直接抛：异常从 forward 里抛出去会被 smolagents 当成工具报错吞掉。
+        # 注意 task_complete 可能在里层 result 里（browser 的返回就是 {ok, result:{...}}）。
+        if isinstance(result, dict):
+            from core.task_receipts import payload, succeeded, navigation_only
+            inner = payload(result)
+            flag = result.get('task_complete') or inner.get('task_complete')
+            if (name == 'browser' and (args or {}).get('action') == 'open' and
+                    inner.get('navigation_verified') and succeeded(result) and navigation_only(self.prompt)):
+                self.done_note = '已在默认浏览器打开目标页面，并核对了地址。'+str(inner.get('title') or '')
+            elif flag and succeeded(result) and navigation_only(self.prompt) and (name!='browser' or inner.get('navigation_verified') or inner.get('page_verified')):
+                self.done_note = str(result.get('message') or inner.get('message')
+                                      or '任务已完成')[:200]
 
     def _queue_image(self, image):
         """收下这一眼的截图，等 _record_step 挂到当前步骤上。
@@ -433,6 +464,9 @@ class ConsoleAgent:
         原文和调用参数一起留下，既写日志也留在 self.failures 里供收尾汇报。
         """
         try:
+            # 工具已经明确说做完了 —— 当场收工，不再让模型继续试。
+            if self.done_note:
+                raise _AgentDone(self.done_note)
             # 2026-11-12 治"取消不了"：ui 的停止按钮只置位 cancel_event，
             # 而 smolagents 的循环根本不看它，所以点了停止它还在跑。
             # 这里每一步都查一次，置位就立刻抛出去，让这一轮真的停下来。
@@ -449,15 +483,23 @@ class ConsoleAgent:
             self.events.append(item)
             if error_text:
                 self.failures.append(item)
-            # 2026-11-12 治卡顿：连续 3 次工具调用都失败就主动掐掉。
-            # 实测日志显示，点不到目标时模型会一个工具一个工具地换着试
-            # （help→uia_read→accessibility→回到截图），把步数烧光才停，
-            # 用户看到的就是"卡死、取消不了"。与其让它烧完，不如停下说清卡点。
-            if len(self.last_calls) >= 3 and not any(c.get('ok') for c in self.last_calls[-3:]):
+            # 2026-11-12 治卡顿：连续失败就主动掐掉，别把步数烧光才停。
+            # 2026-11-20 修误杀：原来"最近三次只要都失败"就停，可模型换着工具试
+            # （click→hotkey→applications）本来就是正常排障，实测问个时间都被拦死。
+            # 现在只有「同一个工具、同一个动作」连错三次才算打转；换着工具试的
+            # 情况放宽到六次都没成功才收手。
+            recent = self.last_calls[-3:]
+            same_call = len({(c.get('name') or '', c.get('action') or '') for c in recent}) == 1
+            if len(recent) == 3 and same_call and not any(c.get('ok') for c in recent):
+                stuck = '%s(%s)' % (recent[-1].get('name') or '', recent[-1].get('action') or '')
+                self.abort_reason = ('同一个工具连续 3 次都失败（%s），判断在原地打转，已主动停下。'
+                                     '这不是被取消，是这几步确实没做成。' % stuck)
+                raise _AgentAborted(self.abort_reason)
+            if len(self.last_calls) >= 6 and not any(c.get('ok') for c in self.last_calls[-6:]):
                 stuck = '；'.join('%s(%s)' % (c.get('name') or '', c.get('action') or '')
                                   for c in self.last_calls[-3:])
-                self.abort_reason = ('连续 3 次工具调用都失败（%s），判断在原地打转，已主动停下。'
-                                     '这不是被取消，是这几步确实没做成。' % stuck)
+                self.abort_reason = ('连续 6 次工具调用都没成功（最后三次：%s），判断在原地打转，'
+                                     '已主动停下。这不是被取消，是这几步确实没做成。' % stuck)
                 raise _AgentAborted(self.abort_reason)
             # 2026-11-12：把这一眼看到的画面挂到本步观察上。smolagents 会在下一轮
             # 把这些图转成真正的 image 消息（memory.py 的 observations_images），
@@ -474,6 +516,8 @@ class ConsoleAgent:
                 item['n'], name, item['ok'],
                 str(_safe_json(arguments))[:300] if arguments is not None else '',
                 error_text[:200]))
+        except _AgentDone:
+            raise
         except _AgentAborted:
             raise
         except Exception:
@@ -492,8 +536,15 @@ class ConsoleAgent:
         self.pending_images = []
         self.last_calls = []
         self.abort_reason = ''
+        self.done_note = ''
+        self.prompt = str(prompt)
         try:
             result = self.agent.run(str(prompt), return_full_result=True)
+        except _AgentDone as exc:
+            # 某个工具已经明确说「这件事做完了」——把它的说明当结果交出去，
+            # 不要再让模型继续试。这是「重复打开」的根治手段。
+            return dict(ok=True, text=self.done_note or str(exc),
+                        steps=len(self.events), done=True)
         except _AgentAborted as exc:
             # 主动收敛：把"卡在哪"直接给用户，而不是抛一个看不懂的异常。
             return dict(ok=False, text='', steps=len(self.events),
@@ -571,7 +622,10 @@ class ConsoleWorker(QObject):
     def _publish_tool_call(self, name, arguments, result):
         """按 SelfAgent 的 activity 契约上报工具调用：{name, arguments, result}。"""
         event = dict(name=str(name), arguments=_safe_json(arguments) if isinstance(arguments, dict) else {},
-                     result=_safe_json(result) if isinstance(result, dict) else {'ok': bool(result)})
+                     result=_safe_json(_strip_inline_images(result)) if isinstance(result, dict) else {'ok': bool(result)})
+        from core.task_receipts import public_fact
+        self.journal.data.setdefault('facts', []).append(public_fact(name, arguments, result))
+        self.journal.data['facts'] = self.journal.data['facts'][-8:]
         try:
             self.journal.data.setdefault('events', []).append(event)
         except Exception:
@@ -603,17 +657,22 @@ class ConsoleWorker(QObject):
         return '\n\n'.join(parts)
 
     def start(self, conversation_id, history, prompt, handoff=None):
-        self.cancel_event.clear()
+        if self._thread is not None and self._thread.is_alive():
+            raise RuntimeError('上一轮仍在收尾，暂未发出新的任务，请稍候')
+        self.cancel_event = threading.Event()
+        self._agent = None
         self._conversation_id = conversation_id
-        self.journal.data = dict(events=[], summary='')
+        self.journal.data = dict(events=[], facts=[], summary='', goal=str(prompt))
         state = {'done': False}
+        state_lock = threading.Lock()
         _log('start conv=%s prompt=%s' % (conversation_id, str(prompt)[:120]))
 
         def emit(payload):
-            if state['done']:
-                _log('emit skipped (already done) ok=%s' % payload.get('ok'))
-                return
-            state['done'] = True
+            with state_lock:
+                if state['done']:
+                    _log('emit skipped (already done) ok=%s' % payload.get('ok'))
+                    return
+                state['done'] = True
             _log('emit ok=%s steps=%s error=%s' % (payload.get('ok'), payload.get('steps'),
                                                    str(payload.get('error') or '')[:160]))
             try:
@@ -648,14 +707,30 @@ class ConsoleWorker(QObject):
                            failure_note=note)
             emit(payload)
 
+        if (handoff or {}).get('_workbuddy_prompt') or (handoff or {}).get('_wechat_message'):
+            from core.self_agent import execute_desktop_handoff
+            def direct():
+                emit(execute_desktop_handoff(self,conversation_id,handoff,self.cancel_event))
+            self._thread=threading.Thread(target=direct,name='guga-desktop-handoff',daemon=True)
+            self._thread.start()
+            return
+
         def watchdog():
+            self.cancel_event.set()
+            facts = list(self.journal.data.get('facts') or [])
+            opened = [x for x in facts if x.get('navigation_verified')]
+            note = ('目标页面已经打开并核对地址。其余要求还没有确认完成。' if opened else
+                    '等待结果的时间较长，目前还不能确认任务是否完成。')
+            self.journal.data['summary'] = note
             emit(dict(conversation_id=conversation_id, kind='local', task_id=conversation_id,
                       ok=False, text='', needs_input=False, read_aloud=False,
                       expression='normal', action='none', backend=BACKEND, steps=0,
-                      error='本轮超过 %d 秒仍未完成，已先返回；后台请求可能仍在继续'
-                            % int(self.timeout_seconds)))
+                      outcome='unconfirmed', timed_out=True,
+                      error='超过本轮等待时间，'+note+'我已停止后续步骤；已经发出的操作需要保留并核对，不会自动重做。'))
 
-        self._timer = threading.Timer(self.timeout_seconds, watchdog)
+        workflow=(handoff or {}).get('_workflow') or {}
+        budget=max(self.timeout_seconds, min(1200, int(workflow.get('budget_seconds') or 0)))
+        self._timer = threading.Timer(budget, watchdog)
         self._timer.daemon = True
         self._timer.start()
         self._thread = threading.Thread(target=work, name='guga-console-agent', daemon=True)

@@ -1,0 +1,154 @@
+{
+  "schema": "guga.app_adapter/1",
+  "id": "doubao",
+  "name": "豆包",
+  "aliases": ["豆包", "doubao", "豆包桌面端"],
+  "capabilities": ["chat", "prompt_engineering", "image", "document", "research"],
+  "automation": "ui_only",
+  "adapter": "core.adapters.doubao_adapter:DoubaoAdapter",
+  "notes": "通用对话与写作/生图；无专用桥，只能界面指挥。首次运行需登录。",
+  "process_names": ["Doubao.exe"],
+  "install": {
+    "user_override": true,
+    "env": ["GUGA_DOUBAO_EXE"],
+    "common_paths": [
+      "%LOCALAPPDATA%\\Doubao\\Application\\Doubao.exe",
+      "%LOCALAPPDATA%\\Doubao\\Doubao.exe",
+      "%ProgramFiles%\\Doubao\\Doubao.exe",
+      "%ProgramFiles(x86)%\\Doubao\\Doubao.exe",
+      "%ProgramFiles%\\Doubao\\Application\\Doubao.exe",
+      "D:\\Doubao\\Application\\Doubao.exe",
+      "D:\\Doubao\\Doubao.exe",
+      "D:\\Program Files\\Doubao\\Doubao.exe",
+      "E:\\Doubao\\Application\\Doubao.exe",
+      "E:\\Doubao\\Doubao.exe"
+    ],
+    "registry": {
+      "uninstall": [
+        {"hive": "HKCU", "view": "any", "display_name_contains": ["豆包", "doubao"]},
+        {"hive": "HKLM", "view": "any", "display_name_contains": ["豆包", "doubao"]}
+      ],
+      "app_paths": ["Doubao.exe"],
+      "location_values": ["InstallLocation", "InstallDir", "InstallPath", "DisplayIcon"]
+    },
+    "start_menu": {
+      "aliases": ["豆包", "doubao"],
+      "roots": []
+    },
+    "portable": {
+      "roots": ["%USERPROFILE%\\Desktop", "%USERPROFILE%\\Downloads", "%USERPROFILE%\\Documents",
+                "D:\\", "E:\\"],
+      "name_globs": ["Doubao.exe"],
+      "depth": 2,
+      "budget_ms": 1200,
+      "max_entries": 600
+    },
+    "path_lookup": true,
+    "detect_running": true
+  },
+  "launch": {
+    "exe_name": "Doubao.exe",
+    "args": [],
+    "cwd": "exe_dir",
+    "timeout_seconds": 25,
+    "show": "min_no_activate",
+    "single_instance": true
+  },
+  "ready": {
+    "window": {
+      "title_keywords": ["豆包", "doubao"],
+      "process": "Doubao.exe",
+      "class_keywords": []
+    },
+    "min_width": 320,
+    "min_height": 240,
+    "extra_settle_seconds": 0.5,
+    "input_anchor": {
+      "must_exist": false,
+      "control_types": ["Edit", "Document"],
+      "name_contains": ["输入", "提问", "发消息", "问点什么"]
+    }
+  },
+  "anchors": {
+    "input": {
+      "uia": {
+        "control_types": ["Edit", "Document"],
+        "name_contains": ["输入", "提问", "发消息", "问点什么"],
+        "automation_ids": []
+      },
+      "geometry": {"band": "bottom", "min_width_ratio": 0.3},
+      "retry": {"focus_attempts": 3, "verify": "readback_text_equals_prompt"}
+    },
+    "send": {
+      "keys": ["ENTER"],
+      "button": {"name_contains": ["发送", "Send"]},
+      "prefer": "key"
+    },
+    "done": {
+      "any": ["action_bar", "stop_button_gone", "answer_text_stable_2s", "artifact_new"],
+      "poll_seconds": 1.0,
+      "stable_seconds": 2.0,
+      "max_wait_seconds": 300,
+      "capture_timeout_seconds": 12.0,
+      "settle_samples": 2
+    },
+    "failure_codes": [
+      {"code": "login_required", "signals": ["登录", "扫码", "验证码", "同意并继续"],
+       "hint": "豆包首次运行需要在窗口里登录后才能接收任务"},
+      {"code": "rate_limited", "signals": ["请求过于频繁", "稍后再试"],
+       "hint": "触发限流，等几分钟再派单，不要连续重试"},
+      {"code": "network_error", "signals": ["网络", "连接失败", "无法连接"],
+       "hint": "检查网络后重新派单"},
+      {"code": "upgrade_required", "signals": ["升级", "更新版本"],
+       "hint": "窗口要求升级，升级完成后再派单"}
+    ]
+  },
+  "receipt": {
+    "mode": "ui_clipboard_select_all",
+    "notes": "回答用 Ctrl+A/Ctrl+C 复制全文；产物看窗口里的下载/保存提示，不承诺固定目录",
+    "artifact_roots": ["%USERPROFILE%\\Downloads", "%USERPROFILE%\\Desktop"],
+    "artifact_globs": ["*.docx", "*.png", "*.jpg", "*.pdf", "*.txt"]
+  },
+  "login": {
+    "required": true,
+    "signals": ["登录", "扫码", "验证码", "同意并继续", "Sign in"],
+    "detect": "title_then_uia",
+    "hint": "豆包首次运行需要在窗口里登录（扫码或手机号）；登录完成后窗口会显示输入框，咕嘎即可派单。"
+  },
+  "channel": {
+    "primary": "mcp",
+    "direction": "guga_server",
+    "transport": "stdio",
+    "registration": "ui",
+    "scope": "account_cloud",
+    "server_name": "guga",
+    "config_path": "",
+    "config_paths": [],
+    "config_format": {
+      "kind": "cloud_form",
+      "official_entry": "插件·技能·伙伴 → 插件 → 右上角 + 添加 → 新建自定义连接器",
+      "main_fields": ["name", "transport", "command", "params", "env", "headers", "endpoint"],
+      "transports": ["HTTP", "STDIO"],
+      "local_choice": "STDIO",
+      "notes": "官方帮助中心 2026-11-06 版：传输类型只有 HTTP / STDIO，官方无 SSE；本地程序选 STDIO，填运行命令、参数、环境变量。保存后即可在任务里用 / 或 @ 搜到；官方未要求重启；没有独立的“连通状态/工具清单”页面，只能看「插件 → 管理」。门槛：需登录，且需个人订阅或团队/企业额度才能进入豆包工作。"
+    },
+    "fallback": "ui-auto",
+    "verified": {
+      "level": "official_ui_only",
+      "evidence": "按官方帮助中心 2026-11-06 版核对：入口为「插件·技能·伙伴 → 插件 → 右上角 + 添加 → 新建自定义连接器」，传输 HTTP/STDIO，无 SSE；官方未公布本地配置文件，也没有可读取的“工具清单”页面。",
+      "at": "2026-11-06"
+    },
+    "ui_steps": [
+      "登录豆包，并确认账号有个人订阅或团队/企业额度（否则进不了豆包工作）。",
+      "打开「插件·技能·伙伴」→「插件」→ 右上角「+ 添加」→「新建自定义连接器」。",
+      "传输类型选 STDIO（官方只有 HTTP / STDIO，没有 SSE）；名称填 guga，按卡片逐项填运行命令、参数、环境变量。",
+      "保存后回到任务输入框，用 / 或 @ 搜索 guga 条目；官方未要求重启。",
+      "没有独立的连通状态/工具清单页面，只能在「插件 → 管理」里看到条目；能否真的连上以咕嘎「验证连接」的真实握手为准。"
+    ],
+    "notes": "豆包支持个人 MCP 连接器，但只能登录后在界面新增并保存在云端，没有本地 mcpServers 文件；官方未公布文件路径，也没有可读取的“工具清单/连通状态”页面。因此本机无法自动写入，也不得把“已创建条目”说成“已接入”；一律按三态：已检测到配置 / 界面已显示 guga / 未验证。"
+  },
+  "download": {
+    "url": "https://www.doubao.com/download/desktop",
+    "hint": "豆包桌面端；常见安装位置 %LOCALAPPDATA%\\Doubao\\Application\\Doubao.exe。"
+  }
+}

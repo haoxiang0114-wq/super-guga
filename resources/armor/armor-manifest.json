@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "armor_clips": {
+    "butler": {
+      "doze": {
+        "frames": "doze/frames",
+        "native_fps": 24.0,
+        "weight": 0.8,
+        "source": "armor",
+        "cache": {
+          "strategy": "full"
+        }
+      }
+    },
+    "scholar": {
+      "heart": {
+        "frames": "heart/frames",
+        "native_fps": 24.0,
+        "weight": 1.0,
+        "source": "armor",
+        "cache": {
+          "strategy": "full"
+        }
+      }
+    },
+    "tactician": {},
+    "steward": {},
+    "navigator": {},
+    "medic": {},
+    "artisan": {}
+  },
+  "fallback_order": [
+    "armor",
+    "butler",
+    "actions"
+  ],
+  "note": "M0.1 七模式契约: resolve_clip 三级回退 armor/<id>/<clip> -> armor/butler/<clip> -> actions/<ns>-motion/<clip>. 召回动画 = summon 片段倒放(reversed), 无需额外素材. 各甲素材到位后在此登记, 表现层零代码改动."
+}

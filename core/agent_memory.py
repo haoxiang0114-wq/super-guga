@@ -226,9 +226,23 @@ class AgentMemoryStore:
                                               [str(agent_id),*values,max(1,min(100,int(limit)))])]
 
     def recent_dialogue(self,agent_id,limit=12,conversation_id=None):
-        if not conversation_id:return []
-        with self.connect() as db:rows=list(db.execute('SELECT role,content,created FROM agent_dialogue WHERE agent_id=? AND conversation_id=? ORDER BY id DESC LIMIT ?',
-                                                      (str(agent_id),str(conversation_id),max(1,min(100,int(limit))))))
+        """这个成员最近说过的话。
+
+        给了 conversation_id 就只看那一段对话；没给就按成员整体取最近几条。
+        原来没给会话号时直接返回空列表，结果两处都读不到东西：
+        议会讨论落库时不带会话号，写完再也读不回来；主动搭话在没有当前对话时
+        也拿不到「最近说过什么」，只能退回空记忆。
+        recall(include_dialogue=True) 仍然要求明确的 conversation_id，
+        不会把旧对话当成长期记忆带进新话题。
+        """
+        rows_limit=max(1,min(100,int(limit)))
+        with self.connect() as db:
+            if conversation_id:
+                rows=list(db.execute('SELECT role,content,created FROM agent_dialogue WHERE agent_id=? AND conversation_id=? ORDER BY id DESC LIMIT ?',
+                                     (str(agent_id),str(conversation_id),rows_limit)))
+            else:
+                rows=list(db.execute('SELECT role,content,created FROM agent_dialogue WHERE agent_id=? ORDER BY id DESC LIMIT ?',
+                                     (str(agent_id),rows_limit)))
         return [dict(r) for r in reversed(rows)]
 
     def recall(self,agent_id,query='',limit=6,include_dialogue=False,conversation_id=None,project_id=None):
@@ -264,6 +278,17 @@ class AgentMemoryStore:
 
     def proactive_topics(self,agent_id,limit=4,conversation_id=None,project_id=None):
         rows=[r for r in self.recent_dialogue(agent_id,16,conversation_id) if r['role']=='user']
+        if not rows and conversation_id:
+            # 当前对话里还没有用户发言（刚开新对话，或主动搭话时用户没说话）。
+            # 可以借用「不属于任何具体会话」的发言（conversation_id 为空：议会讨论、
+            # 旧版本写入、没归档的随口一说）；但属于别的会话的正文一律不搬过来——
+            # 换个对话还被追问同一件事，就是记忆串台。
+            with self.connect() as db:
+                rows=[dict(r) for r in reversed(list(db.execute(
+                    "SELECT role,content,created FROM agent_dialogue "
+                    "WHERE agent_id=? AND conversation_id='' AND role='user' "
+                    "ORDER BY id DESC LIMIT ?",
+                    (str(agent_id),16))))]
         facts=self.facts(agent_id,12,conversation_id,project_id)
         topics=[safe_text(r['content'])[:500] for r in rows if len(safe_text(r['content']))>=4]
         topics[:0]=[safe_text(r['content'])[:500] for r in facts if len(safe_text(r['content']))>=4]

@@ -9,7 +9,6 @@
 - 配置：ai_config.json（api_key/base_url/model/...）
 - 失败兜底：emit failed，调用方回落到台词库
 """
-import json
 import os
 import threading
 import time
@@ -270,3 +269,9 @@ def parse_reply(text: str):
     if not content.strip():
         content = "咕嘎～"
     return expr, action, content.strip()
+
+
+# ---- [teammate-merge] legacy compat re-exports (additive) ----
+from core.legacy_compat import (  # noqa: E402,F401
+    provider_label, endpoint_label, model_config_error,
+)

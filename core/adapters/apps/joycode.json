@@ -1,0 +1,159 @@
+{
+  "schema": "guga.app_adapter/1",
+  "id": "joycode",
+  "name": "JoyCode",
+  "aliases": ["joycode", "joy code", "joy"],
+  "capabilities": ["code", "website"],
+  "automation": "ide_dispatch",
+  "adapter": "core.adapters.joycode_adapter",
+  "notes": "IDE；通过 .guga/inbox 任务文件 + 对话注入执行，回执写 .guga/outbox/<task_id>.json。",
+  "process_names": ["JoyCode.exe"],
+  "install": {
+    "user_override": true,
+    "env": ["GUGA_JOYCODE_LAUNCHER", "GUGA_JOYCODE_EXE"],
+    "common_paths": [
+      "D:\\JoyCode\\JoyCode.exe",
+      "C:\\JoyCode\\JoyCode.exe",
+      "%ProgramFiles%\\JoyCode\\JoyCode.exe",
+      "%ProgramFiles(x86)%\\JoyCode\\JoyCode.exe",
+      "%LOCALAPPDATA%\\Programs\\JoyCode\\JoyCode.exe",
+      "%USERPROFILE%\\JoyCode\\JoyCode.exe",
+      "E:\\JoyCode\\JoyCode.exe"
+    ],
+    "registry": {
+      "uninstall": [
+        {"hive": "HKCU", "view": "any", "display_name_contains": ["joycode", "joy code"]},
+        {"hive": "HKLM", "view": "any", "display_name_contains": ["joycode", "joy code"]}
+      ],
+      "app_paths": ["JoyCode.exe"],
+      "location_values": ["InstallLocation", "InstallDir", "InstallPath", "DisplayIcon"]
+    },
+    "start_menu": {
+      "aliases": ["joycode", "joy code"],
+      "roots": []
+    },
+    "portable": {
+      "roots": ["%USERPROFILE%\\Desktop", "%USERPROFILE%\\Downloads", "%USERPROFILE%\\Documents",
+                "C:\\", "D:\\", "E:\\"],
+      "name_globs": ["JoyCode.exe"],
+      "depth": 2,
+      "budget_ms": 1500,
+      "max_entries": 800
+    },
+    "path_lookup": true,
+    "detect_running": true
+  },
+  "launch": {
+    "exe_name": "JoyCode.exe",
+    "args": [],
+    "cwd": "exe_dir",
+    "timeout_seconds": 30,
+    "show": "min_no_activate",
+    "single_instance": true
+  },
+  "ready": {
+    "window": {
+      "title_keywords": ["joycode", "joy code"],
+      "process": "JoyCode.exe",
+      "class_keywords": []
+    },
+    "min_width": 600,
+    "min_height": 400,
+    "extra_settle_seconds": 1.0,
+    "input_anchor": {
+      "must_exist": false,
+      "control_types": ["Edit", "Document"],
+      "name_contains": ["输入", "提问", "Ask", "消息"]
+    }
+  },
+  "anchors": {
+    "input": {
+      "uia": {
+        "control_types": ["Edit", "Document"],
+        "name_contains": ["输入", "提问", "Ask", "消息"],
+        "automation_ids": []
+      },
+      "geometry": {"band": "bottom", "min_width_ratio": 0.25},
+      "fallback": {"method": "clipboard_length_probe",
+                   "why": "JoyCode 重启后可能渲染正常但拿不到真实焦点；OCR 不可靠"},
+      "retry": {"focus_attempts": 3, "verify": "clipboard_readback"},
+      "hard_limit": "三次焦点确认失败返回 manual_required，不盲打"
+    },
+    "send": {
+      "keys": ["ENTER"],
+      "command_prefix": "/guga-run",
+      "button": {"name_contains": ["发送", "Send"]},
+      "prefer": "key",
+      "after_enter_verify": ["input_empty", "generating_marker"]
+    },
+    "done": {
+      "any": ["outbox_receipt", "stop_button_gone"],
+      "receipt_path": ".guga/outbox/<task_id>.json",
+      "receipt_statuses": ["done", "blocked", "failed"],
+      "poll_seconds": 1.0,
+      "max_wait_seconds": 1800
+    },
+    "failure_codes": [
+      {"code": "manual_required", "signals": ["input_focus_unconfirmed", "panel_closed"],
+       "hint": "JoyCode 输入框拿不到焦点或面板被关，安全中止；请用户手动点一下输入框后重试"},
+      {"code": "no_receipt", "signals": ["outbox_timeout"],
+       "hint": "命令已发出但没回执；先确认任务是否仍在执行，不要重复派单"},
+      {"code": "create_session_crash", "signals": ["创建会话", "前端异常"],
+       "hint": "不要调用「创建会话」命令，已知会触发 JoyCode 前端异常"},
+      {"code": "login_required", "signals": ["登录", "Sign in", "扫码"],
+       "hint": "JoyCode 首次运行需要登录后再派单"}
+    ]
+  },
+  "receipt": {
+    "mode": "workspace_outbox_receipt",
+    "notes": "任务文件写 .guga/inbox/<task_id>.json；回执读 .guga/outbox/<task_id>.json",
+    "workspace_env": ["GUGA_WORKSPACE"],
+    "inbox": ".guga/inbox",
+    "outbox": ".guga/outbox",
+    "receipt_required": true,
+    "artifact_roots": [".", "dist", "build"],
+    "artifact_globs": ["*.html", "*.py", "*.js", "*.zip"]
+  },
+  "login": {
+    "required": true,
+    "signals": ["登录", "Sign in", "扫码", "同意"],
+    "detect": "title_then_uia",
+    "hint": "JoyCode 首次运行需要登录；若面板停在登录/欢迎页，先由用户在窗口内完成登录。"
+  },
+  "channel": {
+    "primary": "mcp",
+    "direction": "guga_server",
+    "transport": "stdio",
+    "registration": "ui_json",
+    "scope": "official_ui_only",
+    "server_name": "guga",
+    "config_path": "",
+    "config_paths": [],
+    "official_entry": "MCP市场 → 全局配置文件 → +MCP配置",
+    "official_success_signal": "右下角提示「添加成功，正在更新」",
+    "restart_required": false,
+    "config_format": {
+      "top_key": "mcpServers",
+      "stdio_fields": ["type", "command", "args", "env"],
+      "type": "stdio",
+      "notes": "官方 2026-11-06 MCP 文档：type 必填，本地程序写 \"stdio\"；支持 stdio / SSE / streamableHttp。官方未公布配置文件的文件系统路径，因此本工具不再默认往 {workspace}/.joycode/mcp.json 写文件，只生成可粘贴 JSON 并引导走官方界面。"
+    },
+    "fallback": "ui-auto",
+    "verified": {
+      "level": "device_local_only",
+      "evidence": "2026-11-07 本开发机用户级 ~/.joycode/joycode-mcp.json 曾存在 guga 条目并完成真实握手；这不是官方公布的落盘路径，事故机/其他机器上不成立，界面只能标“已检测到配置（历史本机证据）”，不能标“已接入”。",
+      "at": "2026-11-07"
+    },
+    "ui_steps": [
+      "打开 JoyCode，左侧进入「MCP市场」→「全局配置文件」→ 点「+MCP配置」。",
+      "把「复制配置」得到的 JSON 整段粘贴进去（必须包含 \"type\": \"stdio\"）。",
+      "保存后看右下角提示：出现「添加成功，正在更新」才算界面已接受；官方未要求重启。",
+      "回到咕嘎点「验证连接」做一次真实握手；能拿到 5 个工具才说明真的连上，否则一律显示“未验证”。"
+    ],
+    "notes": "JoyCode 是 MCP 客户端；官方只有界面入口「MCP市场 → 全局配置文件 → +MCP配置」，没有公布文件系统路径。不再默认写 {workspace}/.joycode/mcp.json；MCP 不可用时可用 .joycode/skills/guga-worker 脚本通道兜底。"
+  },
+  "download": {
+    "url": "https://joycode.jd.com/download/",
+    "hint": "JoyCode 为京东云 IDE；下载页取自本机 product.json 的 downloadUrl。"
+  }
+}

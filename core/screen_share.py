@@ -64,8 +64,9 @@ class ScreenShareController(QObject):
         self._analysis_pending=False
         self._context_frame_at=0.0
         self._local_perception=None
+        self._native_video = False
 
-    def start(self,fps=None,reason='manual'):
+    def start(self,fps=None,reason='manual', *, native_video=False):
         if fps is not None:
             if type(fps) is not int or not 1<=fps<=5:raise ValueError('共享帧率需要是1到5之间的整数')
             self.fps=fps
@@ -74,6 +75,7 @@ class ScreenShareController(QObject):
             already=self._active
             if already:return dict(started=False,already_active=True,**self.status())
             self._generation+=1;generation=self._generation
+            self._native_video = bool(native_video)
             self._stop.clear();self._active=True;self._error='';self._reason=str(reason)[:80]
             self._started_at=time.monotonic();self._seq=0;self._frame_uri='';self._frame_jpeg=b''
             self._frame_image=None
@@ -87,8 +89,9 @@ class ScreenShareController(QObject):
             self._foreground=None;self._context_foreground=None;self._window_changes=0
             self._capture_errors=0;self._capture_recoveries=0
             self._analysis_pending=True;self._gray=None;self._last_at=0.0;self._last_analysis_request=0.0
-            from core.local_perception import LocalPerception
-            self._local_perception=LocalPerception()
+            if not self._native_video:
+                from core.local_perception import LocalPerception
+                self._local_perception=LocalPerception()
             self._thread=threading.Thread(target=self._capture_loop,args=(generation,),name='guga-screen-share',daemon=True)
             self._thread.start()
         return dict(started=True,already_active=False,**self.status())
@@ -125,7 +128,7 @@ class ScreenShareController(QObject):
                 context_foreground=dict(self._context_foreground) if self._context_foreground else None,
                 window_changes=self._window_changes,capture_recoveries=self._capture_recoveries,
                 capture_scope=self.capture_scope,
-                model_bridge='local_uia_then_change_sampling_vision',
+                model_bridge='native_video' if self._native_video else 'local_uia_then_change_sampling_vision',
                 local_perception={k:v for k,v in self.local_context().items() if k not in ('context','elements')})
 
     def context(self,max_age=12):
@@ -219,19 +222,41 @@ class ScreenShareController(QObject):
                 context=self._context,context_age_seconds=round(time.monotonic()-self._context_at,2) if self._context_at else None,
                 foreground=dict(self._foreground) if self._foreground else None)
 
+    def native_frame(self):
+        with self._lock:
+            if (self._active and self._native_video and self._frame_jpeg
+                    and time.monotonic() - self._last_at <= 2.0):
+                return (self._generation, self._seq), self._frame_jpeg
+        return None
+
     def _capture_loop(self,generation):
-        interval=1.0/max(1,min(5,self.fps))
+        native_video = self._native_video
+        interval = 1.0 / (2 if native_video else max(1, min(5, self.fps)))
         process_cache={}
         while not self._stop.is_set() and generation==self._generation:
             started=time.monotonic()
             try:
                 foreground=_foreground_snapshot(process_cache)
                 capture_box=None
-                if self.capture_scope=='foreground_window' and foreground and not foreground.get('own_app'):
+                if (native_video or self.capture_scope=='foreground_window') and foreground and not foreground.get('own_app'):
                     rect=foreground.get('rect') or []
                     if len(rect)==4 and rect[2]-rect[0]>=240 and rect[3]-rect[1]>=180:capture_box=tuple(rect)
+                if native_video and capture_box is None:
+                    # A focused window is the boundary for remote screen share.
+                    # When our controls are frontmost, wait for the next window.
+                    with self._lock:
+                        if generation != self._generation:return
+                        self._frame_jpeg = b''
+                    if self._stop.wait(interval):
+                        return
+                    continue
                 frame=ImageGrab.grab(bbox=capture_box,all_screens=True).convert('RGB')
-                original=frame.size;frame.thumbnail((1280,800),Image.Resampling.BILINEAR)
+                original=frame.size;frame.thumbnail((1280,720 if native_video else 800),Image.Resampling.BILINEAR)
+                jpeg = b''
+                if native_video:
+                    buffer = io.BytesIO()
+                    frame.save(buffer, format='JPEG', quality=70)
+                    jpeg = buffer.getvalue()
                 gray=np.asarray(frame.resize((64,36),Image.Resampling.BILINEAR).convert('L'),dtype=np.int16)
                 with self._lock:
                     if generation!=self._generation or self._stop.is_set():return
@@ -240,6 +265,7 @@ class ScreenShareController(QObject):
                     previous_hwnd=(self._foreground or {}).get('hwnd')
                     window_changed=bool(foreground and foreground.get('hwnd')!=previous_hwnd)
                     self._gray=gray;self._seq+=1;self._last_at=time.monotonic();self._frame_image=frame
+                    if native_video:self._frame_jpeg=jpeg
                     self._frame_size=dict(width=frame.width,height=frame.height,original_width=original[0],original_height=original[1])
                     self._foreground=foreground
                     if change>=1.5 or window_changed:self._last_change=self._last_at
@@ -251,7 +277,7 @@ class ScreenShareController(QObject):
                 if local:local.request(foreground)
                 self.frame_ready.emit(dict(sequence=self._seq,captured_at=self._last_at,change=round(change,2),
                     window_changed=window_changed,capture_box=capture_box,size=self._frame_size,foreground=foreground))
-                if self._analysis_pending and time.monotonic()-self._last_analysis_request>=self.analysis_interval:
+                if not native_video and self._analysis_pending and time.monotonic()-self._last_analysis_request>=self.analysis_interval:
                     buffer=io.BytesIO();frame.save(buffer,format='JPEG',quality=58,optimize=False)
                     uri='data:image/jpeg;base64,'+base64.b64encode(buffer.getvalue()).decode('ascii')
                     with self._lock:self._frame_uri=uri;self._frame_jpeg=buffer.getvalue()

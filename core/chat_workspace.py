@@ -26,6 +26,12 @@ class ChatWorkspace:
             columns={row[1] for row in db.execute('PRAGMA table_info(conversations)')}
             if 'agent_id' not in columns:
                 db.execute("ALTER TABLE conversations ADD COLUMN agent_id TEXT NOT NULL DEFAULT '001'")
+            # 2026-11-12：主人要求「打开咕嘎的对话就是开启 DSH」。
+            # 一个咕嘎对话可以绑定一个真实的 DSH 会话；绑了之后这个对话的
+            # 消息就由 DSH 处理，而不是走咕嘎自己的内核。空值表示纯本地对话。
+            if 'dsh_session_id' not in columns:
+                db.execute('ALTER TABLE conversations ADD COLUMN dsh_session_id TEXT')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_conv_dsh ON conversations(dsh_session_id)')
 
     @contextmanager
     def connect(self):
@@ -113,3 +119,44 @@ class ChatWorkspace:
                 return value
             row = db.execute('SELECT value FROM preferences WHERE key=?', (key,)).fetchone()
             return row[0] if row else None
+
+    # ---------------------------------------------------------------- DSH 绑定
+    def bind_dsh(self, ident, session_id):
+        """把一个咕嘎对话绑定到真实的 DSH 会话。"""
+        session_id = str(session_id or '').strip()
+        if not session_id:
+            raise ValueError('DSH 会话编号不能为空')
+        with self.connect() as db:
+            if db.execute('UPDATE conversations SET dsh_session_id=? WHERE id=?',
+                          (session_id, ident)).rowcount != 1:
+                raise ValueError('会话不存在')
+        return session_id
+
+    def conversation_by_dsh(self, session_id):
+        """按 DSH 会话号反查咕嘎对话；没有就返回 None。"""
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM conversations WHERE dsh_session_id=? LIMIT 1',
+                             (str(session_id or '').strip(),)).fetchone()
+        return dict(row) if row else None
+
+    def dsh_bound(self):
+        """所有已绑定 DSH 会话的对话，供侧栏标出哪些是 DSH 在跑。"""
+        with self.connect() as db:
+            return {r['id']: r['dsh_session_id'] for r in
+                    db.execute('SELECT id,dsh_session_id FROM conversations WHERE dsh_session_id IS NOT NULL')}
+
+    def adopt_dsh(self, session_id, name='DSH 会话', agent_id='001', project_id=None):
+        """把 DSH 里已经存在的会话接进咕嘎侧栏。
+
+        DSH 网页端建的会话咕嘎原本看不到；接进来之后两边是同一个对话。
+        已经接过就直接返回原对话，不重复创建。
+        """
+        session_id = str(session_id or '').strip()
+        if not session_id:
+            raise ValueError('DSH 会话编号不能为空')
+        hit = self.conversation_by_dsh(session_id)
+        if hit:
+            return hit['id']
+        ident = self.create_conversation(name=name, project_id=project_id, agent_id=agent_id)
+        self.bind_dsh(ident, session_id)
+        return ident

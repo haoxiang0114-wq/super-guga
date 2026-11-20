@@ -1,6 +1,6 @@
 """Singing playback is separate from conversational TTS; completion needs a real audio file."""
 import json
-import subprocess,sys,threading,os
+import subprocess,sys,threading
 from pathlib import Path
 from PyQt5.QtCore import QObject,pyqtSignal,QUrl,QTimer
 from PyQt5.QtMultimedia import QMediaPlayer,QMediaContent,QMediaPlaylist

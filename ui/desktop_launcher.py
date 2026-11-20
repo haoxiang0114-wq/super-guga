@@ -1,6 +1,7 @@
 """Small desktop entry that survives hiding the pet; owns no task or audio."""
 from PyQt5.QtCore import Qt, QPoint
 from PyQt5.QtWidgets import QWidget, QPushButton, QHBoxLayout, QMenu, QApplication
+from ui.desktop_position import move_into_work_area
 
 
 class DesktopLauncher(QWidget):
@@ -50,17 +51,20 @@ class DesktopLauncher(QWidget):
         self.menu.addAction('🐧 显示桌宠', lambda: pet.set_pet_hidden(False))
         self.adjustSize()
         settings = pet._config._s
-        screen = QApplication.screenAt(pet.pos()) or QApplication.primaryScreen()
-        area = screen.availableGeometry()
-        self.move(settings.value('desktop/launcher_x', area.right()-self.width()-24, type=int),
-                  settings.value('desktop/launcher_y', area.center().y(), type=int))
+        screen = QApplication.screenAt(pet.frameGeometry().center()) or QApplication.primaryScreen()
+        if screen:
+            area = screen.availableGeometry()
+            self.move(settings.value('desktop/launcher_x', area.right()-self.width()-24, type=int),
+                      settings.value('desktop/launcher_y', area.center().y(), type=int))
         self.keep_on_screen()
 
     def keep_on_screen(self):
-        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
-        area = screen.availableGeometry()
-        self.move(max(area.left(), min(self.x(), area.right()-self.width()+1)),
-                  max(area.top(), min(self.y(), area.bottom()-self.height()+1)))
+        move_into_work_area(self)
+
+    def save_position(self):
+        settings = self.pet._config._s
+        settings.setValue('desktop/launcher_x', self.x())
+        settings.setValue('desktop/launcher_y', self.y())
 
     def open_chat(self):
         if self._dragged:
@@ -96,8 +100,7 @@ class DesktopLauncher(QWidget):
                     self._dragged = True; self.move(target); self.keep_on_screen()
             elif event.type() == QEvent.MouseButtonRelease and self._press is not None:
                 self._press = None
-                self.pet._config._s.setValue('desktop/launcher_x', self.x())
-                self.pet._config._s.setValue('desktop/launcher_y', self.y())
+                self.save_position()
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event):

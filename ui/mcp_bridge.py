@@ -57,7 +57,7 @@ class SelfMCPBridge(QObject):
             if name not in {t['name'] for t in self_tools()} or not isinstance(args, dict):
                 raise ValueError('未知工具或参数类型无效')
             panel = self.pet._ensure_agent_panel()
-            if name in ('computer','wechat') or (name=='applications' and args.get('action') in ('open','list')) or (name=='desktop_command' and args.get('action') in ('open','focus','list')):
+            if name in ('computer','wechat','browser') or (name=='applications' and args.get('action') in ('open','list')) or (name=='desktop_command' and args.get('action') in ('open','focus','list')):
                 def external_work():
                     try:
                         value=panel.runtime.execute(name,args)
@@ -79,7 +79,7 @@ class SelfMCPBridge(QObject):
                         timer.stop();self._respond(socket,dict(ok=False,error='8秒内未收到本次命令的实际回执；没有自动重试',receipt_id=receipt))
                 timer.timeout.connect(check_receipt);timer.start()
                 return
-            if name not in ('app_state','pet_say'):
+            if name not in ('app_state','pet_say') and not (name=='chat_control' and args.get('action')=='state'):
                 panel.store.append(panel.active_id, 'tool', 'MCP 外部调用：' + name + '\n' + json.dumps(args, ensure_ascii=False))
                 panel.render()
             response = dict(ok=result.get('ok') is not False, result=result)

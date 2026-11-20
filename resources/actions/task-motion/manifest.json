@@ -3,11 +3,19 @@
   "states": {
     "thinking": {
       "frames": "look-up-step/frames",
-      "native_fps": 30
+      "native_fps": 30,
+      "placement": {
+        "body_height": 374,
+        "ground_y": 386
+      }
     },
     "working": {
       "frames": "look-up-step/frames",
-      "native_fps": 30
+      "native_fps": 30,
+      "placement": {
+        "body_height": 374,
+        "ground_y": 386
+      }
     }
   },
   "note": "用户已接受本段动作及形象差异；54原生帧/30fps，单次播放。任务间隔10秒，语音、拖拽、困倦和取消优先。"

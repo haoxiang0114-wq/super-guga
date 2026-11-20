@@ -14,7 +14,6 @@ class ProactiveConversation(QObject):
 
     def __init__(self,panel,memory=None,news_provider=None,clock=None):
         super().__init__(panel if isinstance(panel,QObject) else None);self.panel=panel
-        from core.agent_memory import AgentMemoryStore
         self.memory=memory or panel.memory
         self.clock=clock or time.monotonic;self._news_provider=news_provider
         settings=getattr(getattr(panel,'pet',None),'_config',None)
@@ -100,7 +99,9 @@ class ProactiveConversation(QObject):
         if in_call:
             sent=voice.notify_proactive(event,prompt,profile)
             if sent:
-                if style==4:self._daily_last_at=now
+                if style==4:
+                    self._daily_last_at=now
+                    daily.reminder_question(ident,profile.get('user_address') or '饲养员')
                 self._topic_cursor+=1
                 self.last_at=now;self.last_result=dict(event=event,mode='call',agent_id=profile['agent_id'],basis=topics[:2],style=style)
                 self.triggered.emit(self.last_result);return self.last_result
@@ -117,7 +118,8 @@ class ProactiveConversation(QObject):
         if style==4:
             daily=getattr(getattr(self.panel,'runtime',None),'daily_plan',None)
             if daily is not None:
-                return '你是%s。请用一两句温柔鼓励用户，不更改任何勾选。'%profile['display_name']+daily.reminder()
+                question=daily.reminder_question(getattr(self.panel,'active_id',''),profile.get('user_address') or '饲养员',record=False)
+                return '你是%s。自然地问下面这一项，必须保留事项名称，不更改任何勾选：'%profile['display_name']+question+'\n'+daily.reminder()
         if topics:
             memories='\n'.join('- '+str(x)[:500] for x in topics)
             basis='从这些真实长期记忆中选一个具体、不重复的话题。'
@@ -172,7 +174,8 @@ class ProactiveConversation(QObject):
             # Deterministic facts; no model or news round trip for a checklist reminder.
             self._compose_active=False
             daily=self.panel.runtime.daily_plan
-            self.offline_ready.emit(event,daily.encouragement())
+            self.offline_ready.emit(event,daily.reminder_question(
+                getattr(self.panel,'active_id',''),(profile or {}).get('user_address') or '饲养员',record=False))
             return
         response=None;text='';error=''
         try:
@@ -219,7 +222,8 @@ class ProactiveConversation(QObject):
             or getattr(panel,'_last_user_activity',0.0)>context.get('last_activity',0.0)):
             self.last_result.update(state='superseded');return
         if context.get('daily'):
-            text=panel.runtime.daily_plan.encouragement()
+            text=panel.runtime.daily_plan.reminder_question(getattr(panel,'active_id',''),
+                (getattr(panel,'active_profile',None) or {}).get('user_address') or '饲养员')
             if not text:
                 self.last_result.update(state='superseded');return
             self._daily_last_at=time.monotonic()

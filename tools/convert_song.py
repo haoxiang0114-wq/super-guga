@@ -1,5 +1,5 @@
 """One bounded call to the upstream free Seed-VC demo; no paid fallback."""
-import json,sys,time,shutil,wave,subprocess,hashlib
+import json,sys,wave,subprocess,hashlib
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -39,7 +39,7 @@ def convert(source,reference,seconds,title='跳楼机'):
             if .97*seconds<=duration<=1.04*seconds:valid.append((path,duration))
         except Exception:continue
     if not valid:raise RuntimeError('模型返回的不是完整歌曲，拒绝登记为完整翻唱')
-    path,duration=valid[-1];import hashlib;target=folder/('guga-cover-'+hashlib.sha256(title.encode()).hexdigest()[:12]+'.wav')
+    path,duration=valid[-1];target=folder/('guga-cover-'+hashlib.sha256(title.encode()).hexdigest()[:12]+'.wav')
     subprocess.run([str(folder/'bin/ffmpeg.exe'),'-v','error','-y','-i',str(path),'-i',stems['instrumental'],'-filter_complex','[0:a]highpass=f=75,lowpass=f=14000,volume=0.95[v];[1:a]volume=0.8[b];[v][b]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95:level=false[out]','-map','[out]','-ar','44100','-c:a','pcm_s16le',str(target)],check=True,timeout=40,creationflags=0x08000000)
     manifest_path=folder/'library.json';manifest=json.loads(manifest_path.read_text(encoding='utf-8')) if manifest_path.exists() else {}
     manifest[title]=dict(path=str(target),seconds=duration,verified_full_length=True,provider='Plachta/Seed-VC',voice='guga-current-realtime',quality_reviewed=False,pipeline_version=2,separated_vocals=True)

@@ -1,0 +1,158 @@
+{
+  "schema": "guga.app_adapter/1",
+  "id": "workbuddy",
+  "name": "WorkBuddy",
+  "aliases": ["workbuddy", "work buddy", "wb", "工作搭子"],
+  "capabilities": ["prompt_engineering", "document", "slides", "website"],
+  "automation": "bridge",
+  "adapter": "core.workbuddy_bridge",
+  "notes": "一句话扩写成提示词；可从零产出 .pptx/文档，产物落在 %USERPROFILE%\\WorkBuddy 下。",
+  "process_names": ["WorkBuddy.exe"],
+  "install": {
+    "user_override": true,
+    "env": ["GUGA_WORKBUDDY_EXE"],
+    "common_paths": [
+      "%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe",
+      "%LOCALAPPDATA%\\WorkBuddy\\WorkBuddy.exe",
+      "%ProgramFiles%\\WorkBuddy\\WorkBuddy.exe",
+      "%ProgramFiles(x86)%\\WorkBuddy\\WorkBuddy.exe",
+      "D:\\WorkBuddy\\WorkBuddy.exe",
+      "D:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
+      "E:\\WorkBuddy\\WorkBuddy.exe"
+    ],
+    "registry": {
+      "uninstall": [
+        {"hive": "HKCU", "view": "any", "display_name_contains": ["workbuddy", "work buddy"]},
+        {"hive": "HKLM", "view": "any", "display_name_contains": ["workbuddy", "work buddy"]}
+      ],
+      "app_paths": ["WorkBuddy.exe"],
+      "location_values": ["InstallLocation", "InstallDir", "InstallPath", "DisplayIcon"]
+    },
+    "start_menu": {
+      "aliases": ["workbuddy", "work buddy", "wb"],
+      "roots": []
+    },
+    "portable": {
+      "roots": ["%USERPROFILE%\\Desktop", "%USERPROFILE%\\Downloads", "%USERPROFILE%\\Documents",
+                "D:\\", "E:\\"],
+      "name_globs": ["WorkBuddy.exe"],
+      "depth": 3,
+      "budget_ms": 1500,
+      "max_entries": 800
+    },
+    "path_lookup": true,
+    "detect_running": true
+  },
+  "launch": {
+    "exe_name": "WorkBuddy.exe",
+    "args": [],
+    "cwd": "exe_dir",
+    "timeout_seconds": 45,
+    "show": "min_no_activate",
+    "single_instance": true
+  },
+  "ready": {
+    "window": {
+      "title_keywords": ["workbuddy", "work buddy", "工作搭子"],
+      "process": "WorkBuddy.exe",
+      "class_keywords": []
+    },
+    "min_width": 360,
+    "min_height": 240,
+    "extra_settle_seconds": 0.5,
+    "input_anchor": {
+      "must_exist": false,
+      "control_types": ["Edit", "Document"],
+      "name_contains": ["输入", "提问", "描述", "告诉我"]
+    }
+  },
+  "anchors": {
+    "input": {
+      "uia": {
+        "control_types": ["Edit", "Document"],
+        "name_contains": ["输入", "提问", "描述", "告诉我"],
+        "automation_ids": []
+      },
+      "geometry": {"band": "bottom", "min_width_ratio": 0.3},
+      "fallback": {"method": "relative_click", "x_ratio": 0.500, "y_ratio": 0.880,
+                   "then": "paste_and_readback"},
+      "retry": {"focus_attempts": 3, "verify": "readback_text_equals_prompt"}
+    },
+    "send": {
+      "keys": ["ENTER"],
+      "button": {"name_contains": ["发送", "Send"]},
+      "prefer": "key",
+      "after_enter_verify": ["input_empty", "busy_marker_or_artifact_growth"]
+    },
+    "done": {
+      "any": ["busy_marker_gone", "processed_label_seen", "artifact_growth_stopped"],
+      "busy_markers": ["深度思考中", "正在生成", "生成中", "正在思考", "停止生成", "正在调用"],
+      "poll_seconds": 2.0,
+      "max_wait_seconds": 900,
+      "artifact_poll": "pptx_size_and_slide_count"
+    },
+    "failure_codes": [
+      {"code": "credits_required", "signals": ["积分", "额度", "购买", "会员"],
+       "hint": "WorkBuddy 需要积分/会员，按窗口提示由用户确认后继续"},
+      {"code": "generation_failed", "signals": ["发生未知错误", "暂无响应"],
+       "hint": "WorkBuddy 返回未知错误，不要包装成成功；可重试一次或换工具"},
+      {"code": "empty_answer", "signals": ["answer_chars_below_300"],
+       "hint": "抓到的回答过短，可能还在生成或页面没粘上，先核对输入框与生成状态"},
+      {"code": "submit_unconfirmed", "signals": ["input_not_empty", "no_busy_marker"],
+       "hint": "回车后输入框未清空且没有生成中标记，判定为未提交，不要继续等待"}
+    ]
+  },
+  "receipt": {
+    "mode": "clipboard_select_all_plus_artifact_dir",
+    "notes": "回答用页面全选+剪贴板回读；产物以 %USERPROFILE%\\WorkBuddy 下最新任务目录为准",
+    "answer_method": "select_all_copy",
+    "artifact_roots": ["%USERPROFILE%\\WorkBuddy"],
+    "artifact_globs": ["*.pptx", "slides/*.slide", "*.docx", "*.md"],
+    "complete_rule": "连续两次抓取哈希不变且无生成中标记",
+    "ignore_prior_artifacts": true
+  },
+  "login": {
+    "required": true,
+    "signals": ["登录", "扫码", "Sign in", "同意"],
+    "detect": "title_then_uia",
+    "hint": "WorkBuddy 首次运行需要登录；若窗口停在登录页，先由用户在窗口内完成登录再派单。"
+  },
+  "channel": {
+    "primary": "mcp",
+    "direction": "guga_server",
+    "transport": "stdio",
+    "registration": "file",
+    "scope": "user",
+    "server_name": "guga",
+    "config_path": "%USERPROFILE%\\.workbuddy\\mcp.json",
+    "approval_file": "%USERPROFILE%\\.workbuddy\\mcp-approvals.json",
+    "approval_scheme": "workbuddy_trust_v1",
+    "tool_cache": "%USERPROFILE%\\.workbuddy\\mcp-tool-list.json",
+    "config_format": {
+      "top_key": "mcpServers",
+      "stdio_fields": ["command", "args", "env"],
+      "notes": "顶层 {mcpServers:{...}}；条目支持 command/args/env，也支持 streamableHttp(url+type)。本机 craft-anything 条目已验证同一格式。"
+    },
+    "fallback": "ui-auto",
+    "verified": {
+      "level": "config_written+handshake",
+      "evidence": "mcp.json 已写入 guga 条目；按该条目真实拉起 MCP server，initialize/list_tools/get_task 均成功（2026-11-07；2026-11-08 官方文档 + app.asar 反编译 + 真机点界面三重核对路径与入口）",
+      "at": "2026-11-08"
+    },
+    "official_entry": "侧边栏「专家·技能·连接器」→ 连接器页右上角铅笔图标 →「MCP 服务管理」→「＋添加 MCP」",
+    "official_success_signal": "「MCP 服务管理」里条目出现并在「我的 MCP」点「信任」后变可启用",
+    "restart_required": true,
+    "restart_note": "完全退出 WorkBuddy（托盘退出；关窗口无效）再重新打开",
+    "ui_steps": [
+      "先把咕嘎解压到固定目录（例如 D:\\GUGA），不要放在 %TEMP% 解压目录再生成配置：临时目录被清后命令失效，路径变化还会让信任作废。",
+      "V5.9.3 界面入口：侧边栏「专家·技能·连接器」→ 连接器页右上角铅笔图标 →「MCP 服务管理」→「＋添加 MCP」；它打开的其实就是 %USERPROFILE%\\.workbuddy\\mcp.json，界面保存立即生效、无需重启。",
+      "直接改 mcp.json 的路径也对（官方文档写明，app.asar 的 getMcpConfigPath() 也返回这个路径）；但改完必须完全退出 WorkBuddy（托盘退出，关窗口无效）再重启，列表才会刷新。",
+      "首次连接去「MCP 服务管理 → 我的 MCP」点「信任」；不点显示灰色、工具不启用。之后改 command / args / env 会让信任记录失效，需要重新点一次信任。"
+    ],
+    "notes": "WorkBuddy 是 MCP 客户端，咕嘎做 server。配置落点 %USERPROFILE%\\.workbuddy\\mcp.json（官方文档 + app.asar getMcpConfigPath() 双重确认）。外部改文件后必须完全退出（托盘退出）再重启才刷新；改 command/args/env 会作废信任，需回「MCP 服务管理 → 我的 MCP」重新信任。command 不能指向 %TEMP% 解压目录。"
+  },
+  "download": {
+    "url": "https://www.codebuddy.cn/",
+    "hint": "WorkBuddy 是腾讯 CodeBuddy 桌面端；本机常见安装位置 %LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe。"
+  }
+}

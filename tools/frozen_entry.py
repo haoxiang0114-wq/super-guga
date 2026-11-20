@@ -5,7 +5,7 @@ ROOT=Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file
 os.chdir(ROOT)
 
 def smoke(report):
-    import json,time,wave
+    import json,wave
     from launcher import _prepare_qt
     _prepare_qt()
     from PyQt5.QtWidgets import QApplication
@@ -15,7 +15,7 @@ def smoke(report):
     from core.ai_chat import AIChatEngine
     from core.realtime_agent import AgentRealtimeVoice
     from ui.sprite_animator import SpriteAnimator
-    import sounddevice,websocket,edge_tts,win32gui,psutil
+    import sounddevice
     app=QApplication([]);cfg=AIChatEngine._load_config();voice=load_settings()
     record=dict(frozen=bool(getattr(sys,'frozen',False)),chat_configured=bool(cfg.get('api_key')),model=cfg.get('model'),voice_configured=bool(voice.get('api_key')),voice_model=voice.get('model'),voice_endpoint_valid=bool(connection_url(voice)),edge_tts_imported=True,audio_devices=len(sounddevice.query_devices()))
     sprite=SpriteAnimator(str(ROOT/'resources'),250);record['sprite_loaded']=sprite.width>0

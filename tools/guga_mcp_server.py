@@ -35,7 +35,7 @@ def invoke(name, arguments):
 
 
 def serve():
-    app = QCoreApplication([])
+    _app = QCoreApplication([])
     initialized = False
     negotiated = False
     definitions=plugin_tools() if '--plugin-events' in sys.argv else dsh_tools() if '--dsh-tools' in sys.argv else self_tools()

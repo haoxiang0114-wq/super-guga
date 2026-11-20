@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "hearthstone-live",
+  "name": "炉石酒馆战棋",
+  "description": "使用咕嘎已接入的炉石日志、实时对局面板和战棋助手。",
+  "version": "1.0.0",
+  "kind": "feature",
+  "entry": "hearthstone"
+}

@@ -2,7 +2,7 @@
 
 Originals are read-only. Publishing is performed separately in the browser.
 """
-import base64,json,os,re,subprocess,threading,time,uuid
+import base64,json,re,subprocess,threading,time,uuid
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[1]

@@ -1,0 +1,146 @@
+{
+  "_说明": [
+    "复制本文件为 <软件id>.json 即可新增一个适配；文件名以 _ 开头的文件不会被加载。",
+    "本文件同时是两个真实用例的补充说明：剪映（video）与 WPS（slides/document）。",
+    "schema 固定 guga.app_adapter/1；id 必须与 local_tools.APPS 的 id 一致才能被路由复用。",
+    "install 的探测顺序：user_override → env → common_paths → registry → start_menu → PATH → running_process → portable。",
+    "任何来源读取失败都必须记入 errors/incomplete，不能被当成“未安装”。",
+    "anchors 只描述界面锚点与失败码，不写绝对像素坐标；定位优先级仍是 UIA > 相对几何 > 视觉。",
+    "receipt 描述回执/产物获取方式；没有回执能力的软件要写 receipt_required=false 并说明如何判定完成。",
+    "channel 写清该软件走哪条通道：mcp（咕嘎做 server、软件做 client）或 ui-auto（只能界面操作），以及配置文件位置/注册方式。",
+    "channel.registration=file 才可自动写入与检测；registration=ui 时 config_path 留空并在 ui_steps 写清界面操作步骤。"
+  ],
+  "schema": "guga.app_adapter/1",
+  "id": "your-app-id",
+  "name": "软件显示名",
+  "aliases": ["别名1", "alias2"],
+  "capabilities": ["video"],
+  "automation": "ui_only",
+  "adapter": "",
+  "notes": "一句话说明这个软件能干什么、不能干什么。",
+  "process_names": ["YourApp.exe"],
+  "install": {
+    "user_override": true,
+    "env": ["GUGA_YOURAPP_EXE"],
+    "common_paths": [
+      "%ProgramFiles%\\YourVendor\\YourApp\\YourApp.exe",
+      "%ProgramFiles(x86)%\\YourVendor\\YourApp\\YourApp.exe",
+      "%LOCALAPPDATA%\\Programs\\YourApp\\YourApp.exe",
+      "D:\\YourApp\\YourApp.exe",
+      "E:\\YourApp\\YourApp.exe"
+    ],
+    "registry": {
+      "uninstall": [
+        {"hive": "HKCU", "view": "any", "display_name_contains": ["your app", "你的软件"]},
+        {"hive": "HKLM", "view": "any", "display_name_contains": ["your app", "你的软件"]}
+      ],
+      "app_paths": ["YourApp.exe"],
+      "location_values": ["InstallLocation", "InstallDir", "InstallPath", "DisplayIcon"]
+    },
+    "start_menu": {
+      "aliases": ["your app", "你的软件"],
+      "roots": []
+    },
+    "portable": {
+      "roots": ["%USERPROFILE%\\Desktop", "%USERPROFILE%\\Downloads", "D:\\", "E:\\"],
+      "name_globs": ["YourApp.exe"],
+      "depth": 2,
+      "budget_ms": 1200,
+      "max_entries": 600
+    },
+    "path_lookup": true,
+    "detect_running": true
+  },
+  "launch": {
+    "exe_name": "YourApp.exe",
+    "args": [],
+    "cwd": "exe_dir",
+    "timeout_seconds": 30,
+    "show": "min_no_activate",
+    "single_instance": true
+  },
+  "ready": {
+    "window": {
+      "title_keywords": ["你的软件", "your app"],
+      "process": "YourApp.exe",
+      "class_keywords": []
+    },
+    "min_width": 320,
+    "min_height": 240,
+    "extra_settle_seconds": 0.5,
+    "input_anchor": {
+      "must_exist": false,
+      "control_types": ["Edit", "Document"],
+      "name_contains": ["输入", "提问"]
+    }
+  },
+  "anchors": {
+    "input": {
+      "uia": {
+        "control_types": ["Edit", "Document"],
+        "name_contains": ["输入", "提问"],
+        "automation_ids": []
+      },
+      "geometry": {"band": "bottom", "min_width_ratio": 0.3},
+      "retry": {"focus_attempts": 3, "verify": "readback_text_equals_prompt"}
+    },
+    "send": {
+      "keys": ["ENTER"],
+      "button": {"name_contains": ["发送", "Send"]},
+      "prefer": "key",
+      "after_enter_verify": ["input_empty", "busy_marker"]
+    },
+    "done": {
+      "any": ["stop_button_gone", "answer_text_stable_2s", "artifact_new"],
+      "poll_seconds": 1.0,
+      "max_wait_seconds": 300,
+      "settle_samples": 2
+    },
+    "failure_codes": [
+      {"code": "login_required", "signals": ["登录", "扫码", "Sign in"],
+       "hint": "首次运行需要登录"},
+      {"code": "rate_limited", "signals": ["请求过于频繁", "稍后再试"],
+       "hint": "触发限流，等几分钟再派单"},
+      {"code": "artifact_missing", "signals": ["no_output_file"],
+       "hint": "有完成状态但没找到产物，检查导出目录"}
+    ]
+  },
+  "receipt": {
+    "mode": "ui_clipboard",
+    "notes": "没有回执通道时写清楚怎么判定完成、产物在哪",
+    "receipt_required": false,
+    "artifact_roots": ["%USERPROFILE%\\Documents"],
+    "artifact_globs": ["*.mp4", "*.docx", "*.pptx"]
+  },
+  "login": {
+    "required": true,
+    "signals": ["登录", "扫码", "Sign in"],
+    "detect": "title_then_uia",
+    "hint": "首次运行需要在窗口内登录；登录完成后再派单。"
+  },
+  "channel": {
+    "primary": "mcp",
+    "direction": "guga_server",
+    "transport": "stdio",
+    "registration": "file",
+    "scope": "user",
+    "server_name": "guga",
+    "config_path": "%USERPROFILE%\\.your-app\\mcp.json",
+    "config_paths": [],
+    "approval_file": "",
+    "approval_scheme": "",
+    "config_format": {
+      "top_key": "mcpServers",
+      "stdio_fields": ["command", "args", "env"],
+      "notes": "按该软件真实 schema 填写；没有本地文件的软件把 registration 改为 ui 并留空 config_path。"
+    },
+    "fallback": "ui-auto",
+    "verified": {"level": "unverified", "evidence": "", "at": ""},
+    "ui_steps": [],
+    "notes": "软件是 MCP 客户端时由咕嘎做 server；MCP 不可用时退回界面自动化，并在界面标注“界面操作”。"
+  },
+  "download": {
+    "url": "",
+    "hint": "写官网下载页与常见安装位置；未安装时据此给出指引。"
+  }
+}

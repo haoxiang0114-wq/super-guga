@@ -54,20 +54,28 @@ class EvidenceProgress:
         self.receipts=deque(maxlen=8)
         self.count=0;self.reported=-1;self.pending='等待执行器返回结果';self.stale_reported=False
         self.beat=0
+        self.facts=deque(maxlen=6)
 
     def tool_start(self,name,args):
         self.pending=tool_feedback(name,args)
 
     def tool_result(self,name,args,result):
         if not isinstance(result,dict):return
+        from core.task_receipts import public_fact
+        self.facts.append(public_fact(name,args,result))
         self.count+=1
         self.stale_reported=False
         # Keep only fixed tool labels; never narrate raw payloads, credentials,
         # reasoning tokens, or the executing model's unverified success claims.
         label=tool_feedback(name,args)
-        outcome='工具回执成功' if result.get('ok') is True else '未完成'
+        from core.task_receipts import succeeded
+        outcome='工具回执成功' if succeeded(result) else '未完成'
         self.receipts.append(label.replace('正在','',1)+'（'+outcome+'）')
         self.pending='等待下一步执行或核验'
+
+    def snapshot(self,goal=''):
+        return dict(goal=goal,recent_operations=list(self.facts),current=self.pending,
+                    task_finished=False,new_receipts=self.count)
 
     def notice(self, now=None):
         now=time.monotonic() if now is None else now

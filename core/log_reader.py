@@ -364,39 +364,49 @@ def _count_eliminated() -> int:
     return out
 
 
-def _build_board():
-    """从当前状态组装局面"""
-    my_controller = _local_controller
+def _find_real_hero(controller):
+    """同 controller 下 PLAY 区的真实英雄（排除 *_PH 占位）。"""
+    for eid, e in _ents.items():
+        if (e.get('CARDTYPE') == 'HERO' and e.get('ZONE') == 'PLAY'
+                and e.get('CONTROLLER') == controller
+                and not e.get('CARD_ID', '').endswith('_PH')):
+            return eid
+    return None
+
+
+def _resolve_my_hero(my_controller):
+    """定位本地英雄，返回 (my_hero_id, hero_entity)；找不到时 my_hero_id 为 None。
+
+    通过本地玩家实体（Player EntityID=xx）的 HERO_ENTITY tag 定位英雄；
+    酒馆战棋里该 tag 常指向占位英雄（*_PH，SETASIDE 区），真正的英雄是同
+    CONTROLLER 下 PLAY 区的 HERO 实体 —— 换用真实英雄。仍找不到就退回
+    _hero_order 的第一个。注意：走 _hero_order 兜底时不重新读取 hero 实体。
+    """
     my_hero_id = None
-    # 通过本地玩家实体（Player EntityID=xx）的 HERO_ENTITY tag 定位英雄
     p_ent_id = _player_id_to_ent.get(my_controller) if my_controller is not None else None
     if p_ent_id is not None:
         my_hero_id = _ents.get(p_ent_id, {}).get('HERO_ENTITY')
     if my_hero_id is not None:
         my_hero_id = int(my_hero_id)
-    # 酒馆战棋：玩家实体 HERO_ENTITY 常指向占位英雄（*_PH，SETASIDE 区），
-    # 真正的英雄是同 CONTROLLER 下 PLAY 区的 HERO 实体 —— 换用真实英雄
     hero = _ents.get(my_hero_id, {}) if my_hero_id is not None else {}
     if hero.get('ZONE') != 'PLAY' or hero.get('CARD_ID', '').endswith('_PH'):
-        real_hero = None
-        for eid, e in _ents.items():
-            if (e.get('CARDTYPE') == 'HERO' and e.get('ZONE') == 'PLAY'
-                    and e.get('CONTROLLER') == my_controller
-                    and not e.get('CARD_ID', '').endswith('_PH')):
-                real_hero = eid
-                break
+        real_hero = _find_real_hero(my_controller)
         if real_hero is not None:
             my_hero_id = real_hero
             hero = _ents[real_hero]
     # 兜底：第一个真实英雄
     if my_hero_id is None and _hero_order:
         my_hero_id = _hero_order[0]
-    if my_hero_id is None:
-        return None
-    if my_controller is None:
-        my_controller = _hero_player.get(my_hero_id, _ents.get(my_hero_id, {}).get('CONTROLLER'))
-    if my_controller is None:
-        return None
+    return my_hero_id, hero
+
+
+def _hero_controller(my_hero_id):
+    """英雄的控制器：优先 _hero_player 映射，其次实体上的 CONTROLLER tag。"""
+    return _hero_player.get(my_hero_id, _ents.get(my_hero_id, {}).get('CONTROLLER'))
+
+
+def _resolve_player_entity(my_controller):
+    """承载 RESOURCES 的玩家实体：玩家实体优先，其次第一个 name#id 实体。"""
     p_ent = {}
     for pname in _player_order:  # name#id 实体上更新了 RESOURCES 等
         p_ent = _players[pname]
@@ -406,45 +416,54 @@ def _build_board():
         pe = _ents.get(p_eid, {})
         if pe.get('RESOURCES') is not None:
             p_ent = pe
+    return p_ent
 
-    def collect(controller):
-        from core import card_db
-        out = []
-        for eid, ent in _ents.items():
-            if ent.get('CONTROLLER') != controller:
-                continue
-            cid = ent.get('CARD_ID', '')
-            if 'HERO' in cid:
-                continue
-            if ent.get('ZONE') not in ('PLAY', None):
-                continue
-            if ent.get('CARDTYPE') not in (None, 'MINION'):
-                continue
-            if not ent.get('ATK') and not ent.get('HEALTH'):
-                continue
-            db = card_db.lookup(cid) if cid.startswith('BG') else None
-            out.append({
-                'name': cid or f'#{eid}',
-                'atk': ent.get('ATK', 0),
-                'hp': ent.get('HEALTH', 0),
-                'taunt': ent.get('TAUNT', 0) == 1,
-                'divine_shield': ent.get('DIVINE_SHIELD', 0) == 1,
-                'windfury': ent.get('WINDFURY', 0) == 1 or ent.get('MEGA_WINDFURY', 0) == 1,
-                'poison': ent.get('POISONOUS', 0) == 1 or ent.get('VENOMOUS', 0) == 1,
-                'reborn': ent.get('REBORN', 0) == 1,
-                'golden': ent.get('GOLDEN', 0) == 1,
-                'deathrattle': [db['deathrattle']] if db and db.get('deathrattle') else None,
-                'zone_pos': ent.get('ZONE_POSITION', 99),
-            })
-        out.sort(key=lambda x: x['zone_pos'])
-        return out
 
-    mine = collect(my_controller)
-    # 对手：仅当前战斗中在 PLAY 区的随从（按控制器分组，取数量最多的那家）
-    theirs = []
-    opp_groups = {}
-    from core import card_db as _card_db
+def _minion_entry(ent, name, db):
+    """随从的展示字段（己方/对手共用；zone_pos 由己方收集器追加）。"""
+    return {
+        'name': name,
+        'atk': ent.get('ATK', 0),
+        'hp': ent.get('HEALTH', 0),
+        'taunt': ent.get('TAUNT', 0) == 1,
+        'divine_shield': ent.get('DIVINE_SHIELD', 0) == 1,
+        'windfury': ent.get('WINDFURY', 0) == 1 or ent.get('MEGA_WINDFURY', 0) == 1,
+        'poison': ent.get('POISONOUS', 0) == 1 or ent.get('VENOMOUS', 0) == 1,
+        'reborn': ent.get('REBORN', 0) == 1,
+        'golden': ent.get('GOLDEN', 0) == 1,
+        'deathrattle': [db['deathrattle']] if db and db.get('deathrattle') else None,
+    }
+
+
+def _collect_my_minions(controller):
+    """己方场面：PLAY 区（或 ZONE 未知）的随从，按 ZONE_POSITION 排序。"""
+    from core import card_db
+    out = []
     for eid, ent in _ents.items():
+        if ent.get('CONTROLLER') != controller:
+            continue
+        cid = ent.get('CARD_ID', '')
+        if 'HERO' in cid:
+            continue
+        if ent.get('ZONE') not in ('PLAY', None):
+            continue
+        if ent.get('CARDTYPE') not in (None, 'MINION'):
+            continue
+        if not ent.get('ATK') and not ent.get('HEALTH'):
+            continue
+        db = card_db.lookup(cid) if cid.startswith('BG') else None
+        entry = _minion_entry(ent, cid or f'#{eid}', db)
+        entry['zone_pos'] = ent.get('ZONE_POSITION', 99)
+        out.append(entry)
+    out.sort(key=lambda x: x['zone_pos'])
+    return out
+
+
+def _collect_opponent_minions(my_controller):
+    """对手：仅当前战斗中在 PLAY 区的随从（按控制器分组，取数量最多的那家）。"""
+    from core import card_db as _card_db
+    opp_groups = {}
+    for ent in _ents.values():
         c = ent.get('CONTROLLER')
         if c is None or c == my_controller:
             continue
@@ -456,78 +475,111 @@ def _build_board():
         if not ent.get('ATK') and not ent.get('HEALTH'):
             continue
         _db = _card_db.lookup(cid)
-        opp_groups.setdefault(c, []).append({
-            'name': cid,
-            'atk': ent.get('ATK', 0),
-            'hp': ent.get('HEALTH', 0),
-            'taunt': ent.get('TAUNT', 0) == 1,
-            'divine_shield': ent.get('DIVINE_SHIELD', 0) == 1,
-            'windfury': ent.get('WINDFURY', 0) == 1 or ent.get('MEGA_WINDFURY', 0) == 1,
-            'poison': ent.get('POISONOUS', 0) == 1 or ent.get('VENOMOUS', 0) == 1,
-            'reborn': ent.get('REBORN', 0) == 1,
-            'golden': ent.get('GOLDEN', 0) == 1,
-            'deathrattle': [_db['deathrattle']] if _db and _db.get('deathrattle') else None,
-        })
+        opp_groups.setdefault(c, []).append(_minion_entry(ent, cid, _db))
     if opp_groups:
-        theirs = max(opp_groups.values(), key=len)
+        return max(opp_groups.values(), key=len)
+    return []
 
+
+def _game_entity():
+    """GameEntity：优先实体 0；重载 dump 中它是数字实体 id（如 EntityID=13）。"""
     game = _ents.get(0, {})
     if not game.get('TURN'):
-        # 重载 dump 中 GameEntity 用数字实体 id（如 EntityID=13）
         for ge in _ents.values():
             if ge.get('CARDTYPE') == 'GAME' and ge.get('TURN'):
-                game = ge
-                break
-    # FINAL_GAMEOVER is authoritative even if a player entity still carries
-    # PLAYING during the result screen. Do not expose a finished match as live.
-    # The final placement is written to the local hero as
-    # PLAYER_LEADERBOARD_PLACE. Counting LOST entities is not a placement: at
-    # the result screen tags may already be cleared, and that previously
-    # misreported a 4th-place finish as 1st.
-    if game.get('STEP') in ('FINAL_GAMEOVER', 'FINAL_WRAPUP'):
-        local_ps = None
-        if my_controller is not None:
-            p_eid2 = _player_id_to_ent.get(my_controller)
-            if p_eid2 is not None:
-                local_ps = _ents.get(p_eid2, {}).get('PLAYSTATE')
-        place_raw = hero.get('PLAYER_LEADERBOARD_PLACE')
-        if place_raw is None and my_controller is not None:
-            # At the result screen the original hero can be a placeholder or
-            # an old copy. The newest local hero entity carries the final
-            # placement tag.
-            candidates = [(int(eid), ent.get('PLAYER_LEADERBOARD_PLACE'))
-                          for eid, ent in _ents.items()
-                          if ent.get('CARDTYPE') == 'HERO'
-                          and ent.get('CONTROLLER') == my_controller
-                          and ent.get('PLAYER_LEADERBOARD_PLACE') is not None]
-            if candidates:
-                place_raw = max(candidates, key=lambda pair: pair[0])[1]
-        try:
-            final_place = int(place_raw) if place_raw is not None else 0
-        except (TypeError, ValueError):
-            final_place = 0
-        if local_ps not in ('WON', 'LOST', 'CONCEDED'):
-            local_ps = ('WON' if final_place == 1 else
-                        'LOST' if final_place > 1 else 'FINAL_GAMEOVER')
-        return {'active': False, 'reason': 'game_over', 'playstate': local_ps,
-                'place': final_place or None, 'turn': game.get('TURN', 0),
-                'game_serial': _game_serial, 'game_key': _current_game_key()}
-    # ---- 对局是否真的在进行：玩家 PLAYSTATE 结束状态检测 ----
-    if my_controller is not None:
-        p_eid2 = _player_id_to_ent.get(my_controller)
-        if p_eid2 is not None:
-            ps = _ents.get(p_eid2, {}).get('PLAYSTATE')
-            if ps and ps not in ('PLAYING', 'MULLIGAN'):
-                # WON / LOST / CONCEDED / COMPLETE → 对局已结束
-                # 名次近似：吃鸡=第1；出局=本局已出局玩家数（含自己，LOST 结算时含己方）
-                place = 1 if ps == 'WON' else max(1, _count_eliminated())
-                return {'active': False, 'reason': 'game_over', 'playstate': ps,
-                        'place': place, 'turn': game.get('TURN', 0),
-                        'game_serial': _game_serial, 'game_key': _current_game_key()}
+                return ge
+    return game
+
+
+def _local_playstate(my_controller):
+    """本地玩家实体的 PLAYSTATE（拿不到就是 None）。"""
+    if my_controller is None:
+        return None
+    p_eid = _player_id_to_ent.get(my_controller)
+    if p_eid is None:
+        return None
+    return _ents.get(p_eid, {}).get('PLAYSTATE')
+
+
+def _game_over_board(playstate, place, turn):
+    """对局已结束的返回结构（两条结算路径共用）。"""
+    return {'active': False, 'reason': 'game_over', 'playstate': playstate,
+            'place': place, 'turn': turn,
+            'game_serial': _game_serial, 'game_key': _current_game_key()}
+
+
+def _final_game_over_board(hero, my_controller, game):
+    """STEP=FINAL_GAMEOVER/FINAL_WRAPUP：以 FINAL 状态为准，不数 LOST 实体。
+
+    FINAL_GAMEOVER is authoritative even if a player entity still carries
+    PLAYING during the result screen. Do not expose a finished match as live.
+    The final placement is written to the local hero as
+    PLAYER_LEADERBOARD_PLACE. Counting LOST entities is not a placement: at
+    the result screen tags may already be cleared, and that previously
+    misreported a 4th-place finish as 1st.
+    """
+    local_ps = _local_playstate(my_controller)
+    place_raw = hero.get('PLAYER_LEADERBOARD_PLACE')
+    if place_raw is None and my_controller is not None:
+        # At the result screen the original hero can be a placeholder or
+        # an old copy. The newest local hero entity carries the final
+        # placement tag.
+        candidates = [(int(eid), ent.get('PLAYER_LEADERBOARD_PLACE'))
+                      for eid, ent in _ents.items()
+                      if ent.get('CARDTYPE') == 'HERO'
+                      and ent.get('CONTROLLER') == my_controller
+                      and ent.get('PLAYER_LEADERBOARD_PLACE') is not None]
+        if candidates:
+            place_raw = max(candidates, key=lambda pair: pair[0])[1]
+    try:
+        final_place = int(place_raw) if place_raw is not None else 0
+    except (TypeError, ValueError):
+        final_place = 0
+    if local_ps not in ('WON', 'LOST', 'CONCEDED'):
+        local_ps = ('WON' if final_place == 1 else
+                    'LOST' if final_place > 1 else 'FINAL_GAMEOVER')
+    return _game_over_board(local_ps, final_place or None, game.get('TURN', 0))
+
+
+def _playstate_game_over_board(ps, game):
+    """玩家 PLAYSTATE 已结束：WON=吃鸡；其余用本局已出局人数近似名次。"""
+    # WON / LOST / CONCEDED / COMPLETE → 对局已结束
+    # 名次近似：吃鸡=第1；出局=本局已出局玩家数（含自己，LOST 结算时含己方）
+    place = 1 if ps == 'WON' else max(1, _count_eliminated())
+    return _game_over_board(ps, place, game.get('TURN', 0))
+
+
+def _hero_vitals(hero):
+    """(血量, 护甲)：部分英雄血量存在 ARMOR，血量为空时用护甲顶上。"""
     hp = hero.get('HEALTH', 0)
     armor = hero.get('ARMOR', 0)
     if not hp and armor:
-        hp = armor  # 部分英雄血量存在 ARMOR
+        hp = armor
+    return hp, armor
+
+
+def _build_board():
+    """从当前状态组装局面"""
+    my_controller = _local_controller
+    my_hero_id, hero = _resolve_my_hero(my_controller)
+    if my_hero_id is None:
+        return None
+    if my_controller is None:
+        my_controller = _hero_controller(my_hero_id)
+    if my_controller is None:
+        return None
+    p_ent = _resolve_player_entity(my_controller)
+    mine = _collect_my_minions(my_controller)
+    theirs = _collect_opponent_minions(my_controller)
+    game = _game_entity()
+    if game.get('STEP') in ('FINAL_GAMEOVER', 'FINAL_WRAPUP'):
+        return _final_game_over_board(hero, my_controller, game)
+    # ---- 对局是否真的在进行：玩家 PLAYSTATE 结束状态检测 ----
+    if my_controller is not None:
+        ps = _local_playstate(my_controller)
+        if ps and ps not in ('PLAYING', 'MULLIGAN'):
+            return _playstate_game_over_board(ps, game)
+    hp, armor = _hero_vitals(hero)
     return {
         'game_serial': _game_serial,
         'game_key': _current_game_key(),

@@ -1,0 +1,20 @@
+{
+  "source": "G:\\下载文件\\豆包画图 (8).mp4",
+  "source_sha256": "ac0d3d47b8b05399ea97f145d5a2ab2f16709e0b3b9e46b2558a9a4b31b17160",
+  "frames": 241,
+  "native_fps": 24.0,
+  "canvas": [
+    320,
+    416
+  ],
+  "reference_width": 245,
+  "body_height": 304.36,
+  "baseline": 408,
+  "edge_clipped_frames": 0,
+  "min_consecutive_iou": 0.94039,
+  "model": "u2netp-local",
+  "review": "approved",
+  "video_audio_used": false,
+  "source_pixels_preserved": true,
+  "interpolation": false
+}

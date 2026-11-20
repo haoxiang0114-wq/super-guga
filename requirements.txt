@@ -1,4 +1,7 @@
 PyQt5>=5.15
+# Match the desktop's existing Qt 5.15.2 runtime; do not upgrade Qt implicitly.
+PyQtWebEngine==5.15.7
+PyQtWebEngine-Qt5==5.15.2
 av>=14
 PyOpenGL>=3.1.7
 Pillow>=10
@@ -9,6 +12,7 @@ psutil>=5.9
 sounddevice>=0.5
 pywebrtc-audio==0.2.0
 vosk>=0.3
+faster-whisper>=1.2,<2
 pythonnet>=3.0
 websocket-client>=1.8
 numpy>=1.20
@@ -17,3 +21,6 @@ kaldi-native-fbank>=1.22.4
 playwright>=1.49
 markdown-it-py>=3.0
 pygments>=2.15
+# core/adapters/guga_mcp_server.py 在模块级导入 mcp.server.fastmcp，
+# 而 core/mcp_http.py 用 sys.executable 拉起该 server，所以主环境必须装它。
+mcp>=1.10

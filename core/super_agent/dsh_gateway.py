@@ -33,6 +33,11 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+try:
+    from . import dsh_slot
+except ImportError:  # 以裸模块方式导入时（脚本/测试）
+    import dsh_slot  # type: ignore
+
 HOST = '127.0.0.1'
 PORT = 3080
 COOKIE_TTL_SECONDS = 600.0
@@ -43,6 +48,12 @@ COOKIE_TTL_SECONDS = 600.0
 # 而咕嘎这条链路本来就不该有人在场。DSH 的 session/create 没有权限参数，
 # 所以建完立刻用 commands/execute 执行 `/permission <preset>`（不经过模型回合）。
 PERMISSION_PRESET = 'danger-full-access'
+
+# 咕嘎拉起的会话必须落在 DSH 的「咕嘎区」里，而不是散在 DSH 默认目录成为游离会话。
+# DSH 的 session/create 支持 workspaceId（与 cwd 互斥），没有它就只是「无项目会话」。
+GUGA_ROOT = Path(__file__).resolve().parents[2]
+GUGA_WORKSPACE_TITLE = '咕嘎'
+WORKSPACE_STORE = Path.home()/'.dsh'/'storages'/'workspace.json'
 
 
 class GatewayError(RuntimeError):
@@ -218,6 +229,35 @@ def _no_secret(text: str) -> str:
     cleaned = re.sub(r'(dsh-auth[^=]*=)[^;,\s]+', r'\1<redacted>', str(text))
     cleaned = re.sub(r'(token=)[^\s&,;]+', r'\1<redacted>', cleaned, flags=re.I)
     return cleaned
+
+
+def _norm_path(value) -> str:
+    """比较目录用：统一分隔符与大小写，避免同一个目录认成两个项目。"""
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    try:
+        return os.path.normcase(os.path.normpath(text))
+    except (OSError, ValueError):
+        return text.lower()
+
+
+def find_guga_workspace(path=None, store=None) -> str:
+    """在 DSH 的项目存储里找指向咕嘎目录的项目 id；找不到返回空串（只读，不创建）。"""
+    target = _norm_path(path or GUGA_ROOT)
+    if not target:
+        return ''
+    try:
+        data = json.loads(Path(store or WORKSPACE_STORE).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return ''
+    workspaces = ((data or {}).get('tables') or {}).get('workspaces') or {}
+    if not isinstance(workspaces, dict):
+        return ''
+    for workspace_id, item in workspaces.items():
+        if isinstance(item, dict) and _norm_path(item.get('path')) == target:
+            return str(workspace_id)
+    return ''
 
 
 def discover_launch_token() -> str:
@@ -411,6 +451,13 @@ class DshGateway:
         remember_owned(resolved)
         return result
 
+    def cancel(self, session_id: str) -> dict:
+        """Stop only the explicitly named turn; preserve the session and inbox."""
+        sid = str(session_id or '').strip()
+        if not sid:
+            raise GatewayError('cancel 需要明确的 session_id，不允许猜目标会话')
+        return self.rpc('session/cancel', {'request': {'sessionId': sid}})
+
     def resolve_session_id(self, session_id: str) -> str:
         """把任意形态（裸 uuid / session- 前缀 / 后缀）归一到列表里的原样 id。"""
         wanted = str(session_id or '').strip()
@@ -425,15 +472,55 @@ class DshGateway:
         raise GatewayError('目标会话不在 DSH 会话列表里，拒绝投递：' + wanted[:80])
 
     # ------------------------------------------------------------------ 开新对话
-    def create_session(self, conversation_id: str = '', preset: str = '') -> dict:
+    def ensure_workspace(self, path=None, title: str = GUGA_WORKSPACE_TITLE) -> str:
+        """解析（必要时创建）指向咕嘎目录的 DSH 项目，返回 workspaceId。
+
+        `workspace/create` 对同一目录是幂等的；建好后把标题改成「咕嘎」，
+        这样 DSH 侧边栏里是一个明确的咕嘎区，而不是目录名 guga-penguin-pet。
+        任何失败都返回空串——找不到项目不该阻断新建会话。
+        """
+        target = str(path or GUGA_ROOT)
+        try:
+            existing = find_guga_workspace(target)
+            if existing:
+                return existing
+            value = self.rpc('workspace/create', {'request': {'path': target}}, timeout=15.0)
+            workspace = (value or {}).get('workspace') or {}
+            workspace_id = str(workspace.get('workspaceId') or '').strip()
+            if not workspace_id:
+                return ''
+            if title and str(workspace.get('title') or '') != title:
+                try:
+                    self.rpc('workspace/rename',
+                             {'request': {'workspaceId': workspace_id, 'title': title}},
+                             timeout=15.0)
+                except GatewayError:
+                    pass    # 改不了标题不影响会话归属
+            return workspace_id
+        except GatewayError:
+            return ''
+
+    def create_session(self, conversation_id: str = '', preset: str = '',
+                       workspace_id: str = '', strict_grouping: bool = True) -> dict:
         """新建一个空会话，返回真实 sessionId，并登记为「咕嘎自己拉起的对话」。
 
         走的是 3080 同一个内部 RPC 面（`session/create`，实测可用）。
+        会话必须加入「咕嘎区」：`strict_grouping=True` 时拿不到 workspaceId 就**报错不建**。
+        以前这里是静默降级（`ensure_workspace()` 失败返回空串照样建），结果 181 个会话
+        全掉进「未分组」——失败必须响亮，不能变成侧边栏里的一堆垃圾。
         不返回会话编号就报错，绝不假装已经建好。
         """
         request = {'clientTimeZone': 'Asia/Shanghai'}
         if preset:
             request['agentPreset'] = str(preset)[:80]
+        workspace_id = str(workspace_id or '').strip() or self.ensure_workspace()
+        if not workspace_id and strict_grouping:
+            raise GatewayError(
+                '无法把新会话挂到「咕嘎」分组（workspace/create 失败或标题改不动）；'
+                '拒绝新建会话——否则它会掉进「未分组」污染侧边栏。'
+                '先确认 3080 上的 dsh web 正常，再重试派单。')
+        if workspace_id:
+            request['workspaceId'] = workspace_id
         result = self.rpc('session/create', {'request': request}, timeout=20.0)
         result = result if isinstance(result, dict) else {}
         session_id = str(result.get('sessionId') or result.get('session_id') or '').strip()
@@ -448,6 +535,7 @@ class DshGateway:
         return dict(ok=True, session_id=session_id,
                     agent_preset=str(result.get('agentPreset') or ''),
                     conversation_id=str(conversation_id or ''),
+                    workspace_id=workspace_id,
                     permission=permission,
                     full_access=bool(permission.get('ok')))
 
@@ -488,17 +576,54 @@ class DshGateway:
         return dict(ok=ok, before=before, after=after, preset=PERMISSION_PRESET,
                     error='' if ok else '权限切换后复核不一致')
 
-    def start_task(self, text: str, conversation_id: str = '', mode: str = 'queue') -> dict:
-        """开一个新对话并立刻投第一条指令——咕嘎托管 DSH 的最小闭环。"""
+    def session_running(self, session_id: str) -> bool:
+        """会话是否还在跑一轮（单槽闸门的探活口）。
+
+        探不到就当「还在跑」：宁可让下一个任务多排一会儿，也不并发抢同一个工作区。
+        """
+        session_id = str(session_id or '').strip()
+        if not session_id:
+            return False
+        try:
+            view = self.session_view(session_id)
+        except Exception:  # noqa: BLE001
+            return True
+        return bool((view or {}).get('running'))
+
+    def start_task(self, text: str, conversation_id: str = '', mode: str = 'queue',
+                   ticket_id: str = '') -> dict:
+        """开一个新对话并立刻投第一条指令——咕嘎托管 DSH 的最小闭环。
+
+        单槽闸门（2026-11-14 事故后加的硬规则）：同一时刻只允许一个咕嘎会话在跑。
+        已有会话在跑时**不新建**，返回 ``busy=True`` 和当前占用者，由调用方排队。
+        以前这里无条件 ``create_session``，外层循环把它放大成半小时 122 个会话，
+        全部落在「未分组」并互相抢目录。
+        """
+        slot = dsh_slot.status(probe=self.session_running)
+        if slot.get('active'):
+            return dict(ok=False, busy=True, accepted=False, session_id='',
+                        active_session_id=slot.get('session_id') or '',
+                        active_ticket=slot.get('ticket_id') or '',
+                        error='已有咕嘎会话在跑（%s），本次排队，不新建会话' % slot.get('reason'))
         created = self.create_session(conversation_id=conversation_id)
         session_id = created['session_id']
+        claimed = dsh_slot.claim(session_id, ticket_id=ticket_id, probe=self.session_running)
+        if not claimed.get('ok'):
+            return dict(ok=False, busy=True, accepted=False, session_id=session_id,
+                        active_session_id=claimed.get('active_session_id') or '',
+                        error='抢单槽失败，本次不投递：' + str(claimed.get('reason') or ''))
         try:
             self.prompt(session_id, text, mode=mode)
         except Exception as exc:  # noqa: BLE001
             # 会话建了但指令没进去：如实报告并带回会话编号，方便人工收尾；不自动重投。
+            dsh_slot.release(session_id)
             return dict(ok=False, session_id=session_id, accepted=False,
                         error='新会话已建立，但第一条指令没有投递成功：' + _no_secret(str(exc))[:200])
-        return dict(ok=True, session_id=session_id, accepted=True)
+        return dict(ok=True, session_id=session_id, accepted=True, slot=True)
+
+    def finish_task(self, session_id: str = '') -> dict:
+        """任务结束放槽。咕嘎在对账/交付后必须调用，否则下一个任务会一直排队。"""
+        return dsh_slot.release(session_id)
 
     # ------------------------------------------------------------------ 健康
     def health(self) -> dict:

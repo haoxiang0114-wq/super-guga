@@ -2,11 +2,64 @@
 import html
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 FAST_DIAGNOSTICS_PATH=Path(__file__).resolve().parents[1]/'runtime/voice/fast_command_diagnostics.json'
 SCREEN_SHARE_DIAGNOSTICS_PATH=Path(__file__).resolve().parents[1]/'runtime/screen-share-lifecycle.json'
+
+
+def execution_backend_command(text):
+    value=re.sub(r'\s+','',str(text)).lower().strip('。！!')
+    return {'切换到旧执行器':'self','切换到本地智能体':'self','切换到本地执行器':'self',
+            '咕嘎自己处理':'self','切换到咕嘎':'self','开启咕嘎':'self',
+            '开启codex':'codex','启用codex':'codex','开启dsh':'dsh','启用dsh':'dsh','切换到dsh':'dsh',
+            '开启workbuddy':'workbuddy','切换到workbuddy':'workbuddy',
+            '切换到dsh执行器':'dsh','切换到自动执行器':'auto',
+            '切换到codex':'codex','切换到codex执行器':'codex',
+            '切换执行器codex':'codex','切换到codex桌面端':'codex','切换到codex桌面端执行器':'codex',
+            '切换到chatgpt桌面端':'codex','切换到chatgpt桌面端执行器':'codex'}.get(value)
+
+
+def codex_command(text):
+    """Only explicit desktop delegation/control; merely mentioning Codex stays chat."""
+    value=re.sub(r'^(?:(?:请你?|帮我|麻烦你?)[，,\s]*)+','',str(text).strip()).strip('。！!？? ')
+    name=r'(?:codex(?:\s*桌面端)?|chatgpt\s*桌面端)'
+    if re.fullmatch(r'(?:打开|切到|切换到|查看)\s*'+name+r'\s*(?:的)?(?:任务)?(?:对话|会话|窗口)?',value,re.I):
+        return dict(action='open')
+    if re.fullmatch(r'(?:停止|取消|中止)\s*'+name+r'\s*(?:的)?(?:当前)?(?:任务|执行)?',value,re.I):
+        return dict(action='stop')
+    if (re.fullmatch(r'(?:查看|查询|查一下|看看|汇报)?\s*'+name+r'\s*(?:的|现在|当前)?(?:任务)?(?:的)?\s*(?:进度|进展|状态|做到哪了|完成了吗|做完了吗)(?:怎么样(?:了)?|如何|呢)?',value,re.I)
+            or re.fullmatch(r'(?:查看|查询|查一下|看看|汇报)\s*'+name+r'\s*(?:的)?(?:当前)?任务',value,re.I)):
+        return dict(action='status')
+    match=re.fullmatch(r'(?:交给|交由|让|用|使用)\s*'+name+r'\s*[：:，,]?\s*(.*)',value,re.I|re.S)
+    if match:
+        task=match.group(1).strip()
+        if re.fullmatch(r'(?:停止|取消|中止)(?:当前)?(?:任务|执行)?',task):return dict(action='stop')
+        if re.fullmatch(r'(?:查询|查看|汇报|报告)(?:当前)?(?:任务)?(?:进度|状态|进展)',task):return dict(action='status')
+        return dict(action='start',text=task)
+    match=re.fullmatch(r'(?:把|将)(.+?)(?:交给|交由)\s*'+name,value,re.I|re.S)
+    if match:return dict(action='start',text=match.group(1).strip())
+    return None
+
+
+CODEX_STATES={'dispatching':'正在派发','queued':'已受理，等待执行','starting':'正在启动',
+              'running':'正在执行','needs_input':'等待确认或补充',
+              'stop_requested':'已请求停止，等待确认','stopping':'正在收尾，等待停止确认',
+              'completed':'已返回结果，待核验','failed':'任务失败','stopped':'已确认停止',
+              'cancelled':'已确认停止','canceled':'已确认停止','interrupted':'已确认停止',
+              'unknown':'任务状态未知','monitor_disconnected':'监测连接已断开，任务状态未知',
+              'delivery_unknown':'派发结果待核对，请勿重复发送'}
+
+
+def codex_status_text(result):
+    task=result.get('task') or {}
+    if not task:return '当前咕嘎对话尚未绑定 Codex 任务。'
+    state=str(task.get('state') or 'unknown')
+    detail=task.get('error') if state in ('failed','monitor_disconnected','delivery_unknown') else None
+    detail=detail or task.get('summary') or task.get('text') or '尚未收到新进度；受理不代表完成。'
+    return 'Codex 状态：'+CODEX_STATES.get(state,'任务状态待确认')+'。\n'+str(detail)
 
 
 def profile_only(memory,agent_id,limit=6):
@@ -48,10 +101,8 @@ def search_mode_of(panel):
 
 
 from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
-from PyQt5.QtGui import QFont, QPixmap
-from PyQt5.QtWidgets import (QDialog, QFrame, QHBoxLayout, QVBoxLayout, QLabel, QPushButton,
-    QTreeWidget, QTreeWidgetItem, QTextBrowser, QPlainTextEdit, QInputDialog, QMenu,
-    QSplitter, QCheckBox, QMessageBox, QApplication)
+from PyQt5.QtWidgets import (QDialog, QTreeWidgetItem, QInputDialog, QMenu,
+    QMessageBox, QApplication)
 
 from core.chat_workspace import ChatWorkspace
 from core.chat_render import render_markdown
@@ -64,6 +115,7 @@ from ui.agent_runtime import AppRuntime
 class AgentChatWindow(QDialog):
     fast_result=pyqtSignal(object,object)
     screen_answer_ready=pyqtSignal(object)
+    artifact_ready=pyqtSignal(object)
 
     def __init__(self, pet, store=None, memory=None, agent_id=None):
         # The chat is an independent desktop surface, including when the pet is hidden.
@@ -82,6 +134,7 @@ class AgentChatWindow(QDialog):
         self.busy = False
         self.voice_active = False
         self.voice = None
+        self._native_video_call = False
         self._voice_task = None
         self._voice_readback = False
         self._task_control = TaskControlGate()
@@ -96,11 +149,14 @@ class AgentChatWindow(QDialog):
         self._voice_departing=False
         self._voice_farewell_started=0.0
         self._fast_inflight=False
+        # 被"桌面正忙"挡下的启动请求：占用结束后自动补开一次（见 _replay_pending_launch）
+        self._pending_launch=None
+        self._fast_launch_at=0.0
         self.fast_result.connect(self._finish_fast_command)
         self.show_archived = False
         self.expanded_logs = set()
         self.runtime = AppRuntime(pet, self, self.store)
-        self.bridge = ToolBridge(self.runtime.execute, self)
+        self.bridge = ToolBridge(self.runtime.execute_internal, self)
         from core import agent_console
         try:
             from core.model_settings import load_config
@@ -137,9 +193,23 @@ class AgentChatWindow(QDialog):
         self._task_feedback_sequence=0
         self._dsh_last_notice=0
         self._task_reporter=None
+        from core.companion_report import CompanionReporter
+        self.public_reporter=CompanionReporter(self)
+        self.public_reporter.ready.connect(self._public_report_ready)
+        self.artifact_ready.connect(self._deliver_artifacts)
+        self._delivery_seen=set();self.result_board=None
         self._dsh_reports={}
+        self._codex_tasks={}
+        self._task_speech_owners={}
+        self._codex_closing=False
         self._web_facts={}
         self._pending_execution=None
+        self._pending_alignment=None;self._alignment_enabled=True
+        self._manager_enabled=True;self._executor_view=False
+        self.store.preference('execution_backend',self.pet._config._s.value('team/executor','auto'))
+        from core.managed_chat import ManagedChats
+        self.managed=ManagedChats(self);self.managed.changed.connect(self._managed_update)
+        self.pet._agent_bubble.alignment_selected.connect(self._choose_alignment)
         self._active_workflow=None
         self._active_route=None
         self._active_task_text=''
@@ -204,8 +274,10 @@ class AgentChatWindow(QDialog):
         """Display exactly one desktop bubble and optionally synthesize its speech."""
         ident=conversation_id or self.active_id;display=str(text or '').strip()
         if not display:return
+        from core.embodiment import reply_performance
+        expression, action = reply_performance(spoken_text or display, expression, action)
         if speak and (not self.voice_active or self._manual_voice_turn or not getattr(self.voice,'connected',False)):
-            self._pending_tts_display=dict(text=display,ident=ident,expression=expression,action=action)
+            self._pending_tts_display=dict(text=display,ident=ident,agent_id=self.active_agent_id,expression=expression,action=action)
             if hasattr(self.pet,'_apply_agent_style'):self.pet._apply_agent_style(expression,action)
             from core.agent_identity import voice_preferences
             profile=voice_preferences(self.active_profile) if self.active_agent_id!='001' else None
@@ -218,13 +290,14 @@ class AgentChatWindow(QDialog):
     def _local_tts_playback_started(self,_text):
         pending=self._pending_tts_display;self._pending_tts_display=None
         if not pending:return
+        if pending['ident']!=self.active_id or pending.get('agent_id',self.active_agent_id)!=self.active_agent_id:return
         manager=getattr(self.pet,'_multi_agent',None)
         if manager is not None and self.active_agent_id!='001':manager.say(self.active_agent_id,pending['text'],pending.get('expression'))
         elif hasattr(self.pet,'_show_agent_bubble'):self.pet._show_agent_bubble(pending['text'],pending['ident'])
 
     def _local_tts_failed(self,message):
         pending=self._pending_tts_display;self._pending_tts_display=None
-        if pending:
+        if pending and pending['ident']==self.active_id and pending.get('agent_id',self.active_agent_id)==self.active_agent_id:
             self._show_active_bubble(pending['text'])
             self.status.setText(str(message)+' · 已显示文字')
 
@@ -238,29 +311,77 @@ class AgentChatWindow(QDialog):
         if manager is not None and self.active_agent_id!='001':manager.set_expression(self.active_agent_id,name)
         else:self.pet._anim.set_expression(name)
 
+    def _sync_dsh_sessions(self):
+        if getattr(self,'_manager_enabled',False):return  # No automatic import of unrelated DSH chats.
+        """把 DSH 里真实存在的会话接进侧栏（带节流，避免每次刷新都走网络）。
+
+        主人 2026-11-12 的要求：打开咕嘎的对话就是开启 DSH。所以侧栏里必须
+        能看到 DSH 那边的会话；不接进来就还是两套东西。同步失败不影响本地
+        对话列表，只是少显示几条。
+        """
+        import time
+        now = time.monotonic()
+        if now - getattr(self, '_dsh_sync_at', 0.0) < 30:
+            return
+        self._dsh_sync_at = now
+        try:
+            from core.super_agent.dsh_sync import sync_sessions
+            sync_sessions(self.store, agent_id=self.active_agent_id)
+        except Exception:
+            pass
+
     def refresh_tree(self):
         self.tree.clear()
+        self._sync_dsh_sessions()
         snapshot = self.store.snapshot(self.show_archived,agent_id=self.active_agent_id)
         groups = {}
-        root = QTreeWidgetItem(self.tree, ['独立对话' if not self.show_archived else '已归档'])
+        root = QTreeWidgetItem(self.tree, ['最近对话' if not self.show_archived else '已归档'])
         groups[None] = root
         for p in snapshot['projects']:
             item = QTreeWidgetItem(self.tree, [p['name']])
             item.setData(0, Qt.UserRole, ('project', p['id']))
             groups[p['id']] = item
         for c in snapshot['conversations']:
-            item = QTreeWidgetItem(groups.get(c['project_id'], root), ['◌  ' + c['name']])
-            item.setToolTip(0, c['name'])
+            row=self.managed.get(c['id'])
+            backend='咕嘎' if row['backend']=='guga' else row['backend'].upper();bound=row.get('external_id') or ''
+            state=CODEX_STATES.get(row['state'],{'new':'待连接','connecting':'正在连接','ready':'已连接',
+                'disconnected':'连接中断'}.get(row['state'],row['state']))
+            title = c['name'] if backend == '咕嘎' else backend + ' · ' + c['name']
+            item = QTreeWidgetItem(groups.get(c['project_id'], root),[title])
+            item.setToolTip(0,c['name']+'\n'+backend+' · '+state+('\n对话：'+bound if bound else ''))
             item.setData(0, Qt.UserRole, ('conversation', c['id']))
             if c['id'] == self.active_id:
                 self.tree.setCurrentItem(item)
+        # 2026-11-12：插件市场。DSH 装了什么插件这里也列出来，两边共用一份清单，
+        # 不用在咕嘎里再维护一套「装了什么」。只读展示，装卸仍走 DSH。
+        plugins_root = None
+        try:
+            from core.super_agent.dsh_plugins import summary as _plugin_summary
+            info = _plugin_summary()
+            if info.get('total'):
+                plugins_root = QTreeWidgetItem(self.tree, ['插件 · %d' % info['total']])
+                plugins_root.setToolTip(0, 'DSH 已装插件：启用 %d，停用 %d'
+                                        % (info.get('enabled', 0), info.get('disabled', 0)))
+                for plugin in info.get('plugins') or []:
+                    flag = '✓' if plugin.get('enabled') else '✗'
+                    node = QTreeWidgetItem(plugins_root, ['%s  %s' % (flag, plugin.get('id') or '')])
+                    node.setToolTip(0, plugin.get('name') or plugin.get('id') or '')
+                    node.setData(0, Qt.UserRole, ('plugin', plugin.get('id') or ''))
+        except Exception:
+            plugins_root = None
         self.tree.expandAll()
+        if plugins_root is not None:
+            plugins_root.setExpanded(False)   # 插件清单默认收起，不挤占对话列表
         if self.active_id:
             self.title.setText(self.active_profile['display_name']+' · '+self.store.conversation(self.active_id)['name'])
-            self.model_label.setText(self.active_profile['role']+' · '+self.active_profile['specialty'])
+            self.title.setToolTip(self.title.text())
 
     def _selected(self, item, column=0):
         data = item.data(0, Qt.UserRole)
+        if data and data[0] == 'plugin':
+            # 插件清单只读展示；装卸走 DSH，避免咕嘎直接改 DSH 的配置把 DSH 弄坏。
+            self.status.setText('插件「%s」由 DSH 管理，装卸请到 DSH 的插件市场' % (data[1] or ''))
+            return
         if data and data[0] == 'conversation':
             if self.busy or self.voice_active:
                 self.status.setText('请先结束本轮或语音通话，再切换会话')
@@ -268,12 +389,18 @@ class AgentChatWindow(QDialog):
             self.open_conversation(data[1])
 
     def open_conversation(self, ident):
+        pending=getattr(self,'_pending_alignment',None)
+        if pending and pending['ident']!=ident:
+            self._pending_alignment=None;self.pet._agent_bubble.clear_alignment()
         if hasattr(self,'attachment_bar'):self._clear_attachment()
         self.active_id = ident
+        if getattr(self,'_manager_enabled',False):self.managed.refresh(ident)
         self.store.preference('active_conversation', ident)
         self.store.preference('agent/%s/active_conversation'%self.active_agent_id,ident)
         self.refresh_tree()
+        self.refresh_companion_header()
         self.render()
+        self.stop_button.setEnabled(bool(self.busy or self._codex_running() or self.runtime.music.requested))
 
     def _rich_message(self,key,content):
         """One message -> Qt rich HTML, cached by (key, content)."""
@@ -295,10 +422,188 @@ class AgentChatWindow(QDialog):
         self._render_cache[key]=(content,rendered,codes)
         return rendered,codes
 
+    def _dsh_transcript(self, session_id):
+        """读 DSH 会话记录（按文件修改时间缓存，render 很频繁不能每次都解压）。"""
+        try:
+            from core.super_agent.dsh_transcript import read_transcript, session_dir
+            folder = session_dir(session_id)
+            if folder is None:
+                return []
+            log = folder / 'session.v4.jsonl.zstd'
+            stamp = log.stat().st_mtime
+        except Exception:
+            return []
+        cache = getattr(self, '_transcript_cache', None)
+        if cache is None:
+            cache = {}
+            self._transcript_cache = cache
+        hit = cache.get(session_id)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        try:
+            rows = read_transcript(session_id, limit=200)
+        except Exception:
+            rows = []
+        cache[session_id] = (stamp, rows)
+        return rows
+
+    def _messages_for(self, ident):
+        """取这个对话该显示的消息。
+
+        绑定了 DSH 会话的对话以 **DSH 的真实记录**为准——这样你在 DSH 网页端
+        看到的就是同一份对话；本地刚发、DSH 还没写进日志的消息补在后面。
+        没绑定 DSH 的对话照旧走本地存储。
+        """
+        local = self.store.messages(ident)
+        if getattr(self,'_manager_enabled',False):
+            remote=self.managed.cache.get(ident,[])
+            if self._executor_view:
+                return [dict(id='remote-'+str(x.get('id') or x.get('seq') or i),role=x['role'],content=x['text']) for i,x in enumerate(remote)]
+            # Guga's conversation remains the main view. Raw executor replies
+            # are available through the explicit history toggle above.
+            visible=[]
+            for message in local:
+                if (visible and message.get('role')=='assistant' and
+                        message.get('content','').startswith('这次连接或派单没有确认：') and
+                        visible[-1].get('content')==message.get('content')):
+                    continue
+                visible.append(message)
+            return visible
+        try:
+            session_id = str(self.store.conversation(ident).get('dsh_session_id') or '').strip()
+        except Exception:
+            return local
+        if not session_id:
+            return local
+        remote = self._dsh_transcript(session_id)
+        if not remote:
+            return local
+        from core.super_agent.dsh_transcript import merge_messages
+        return merge_messages(local,remote)
+
+    def _send_to_bound_dsh(self, ident, session_id, text):
+        """把这句话投进已绑定的 DSH 会话，然后盯着它出回复。
+
+        投递是同步 HTTP（几百毫秒，可接受）；等回复用主线程定时器轮询，
+        不另开线程去碰界面——跨线程改控件是崩溃的常见来源。
+        """
+        import time
+        from core.super_agent.dsh_gateway import DshGateway
+        baseline=max((int(row.get('seq') or 0) for row in self._dsh_transcript(session_id)),default=0)
+        try:
+            from core.artifact_review import delivery_instructions
+            DshGateway().prompt(session_id, text+delivery_instructions(text), mode='queue')
+        except Exception as exc:
+            self.status.setText('投递失败：' + str(exc)[:120])
+            self.render()
+            return False
+        self._bound_watch = dict(session_id=session_id, ident=ident,
+                                 before=len(self._dsh_transcript(session_id)),
+                                 deadline=time.monotonic() + 900)
+        if not hasattr(self,'_dsh_monitor'):
+            from core.bound_dsh import BoundDshMonitor
+            self._dsh_monitor=BoundDshMonitor(self)
+            self._dsh_monitor.update.connect(self._bound_dsh_update)
+            self._dsh_monitor.notice.connect(self._bound_dsh_notice)
+        from core.dsh_progress import reporting_config
+        self._dsh_monitor.start(ident,session_id,baseline,reporting_config(self.store,ident),goal=text)
+        self.status.setText('已交给 DSH，等它回复…')
+        self.render()
+        return True
+
+    def _tick_bound(self):
+        if hasattr(self,'_dsh_monitor'):self._dsh_monitor.poll()
+
+    def _bound_dsh_update(self,state):
+        if state.get('generation')!=self._dsh_monitor.status().get('generation'):return
+        if state.get('state')=='completed':
+            self._begin_result_delivery(state['conversation_id'],state.get('goal',''),state.get('summary',''),
+                str(Path(__file__).resolve().parents[1]),state.get('started_at',time.time()),'bound-'+state.get('generation',''))
+            if state.get('conversation_id')==self.active_id:
+                self._show_active_bubble('这一轮已返回结果，我来核对最终内容和文件。')
+        if state.get('state') in ('completed','disconnected'):self._bound_watch=None
+        if state.get('conversation_id')!=self.active_id:return
+        labels={'queued':'DSH 已受理，等待本轮回复','running':'DSH 正在执行，尚未完成',
+                'completed':'DSH 本轮已结束，结果待核验','disconnected':'DSH 监测已断开，任务状态未知'}
+        self.status.setText(labels.get(state.get('state'),'DSH 状态待确认'))
+        self.render()
+
+    def _bound_dsh_notice(self,notice):
+        state=self._dsh_monitor.status()
+        self._request_public_report('bound-'+str(state.get('generation'))+'-'+str(notice['number']),
+            dict(goal=state.get('goal','当前任务'),state=state.get('state'),
+                 executor_claim=state.get('summary',''),observed_progress=notice['text']),
+            notice['text'],notice['conversation_id'],generation=state.get('generation'),source='bound')
+
+    def _request_public_report(self,key,facts,fallback,ident=None,**extra):
+        context=dict(conversation_id=ident or self.active_id,agent_id=self.active_agent_id,**extra)
+        return self.public_reporter.request(key,facts,fallback,context)
+
+    def _public_report_ready(self,event):
+        context=event['context'];ident=context['conversation_id']
+        if ident!=self.active_id or context['agent_id']!=self.active_agent_id:return
+        if context.get('source')=='local_progress' and (not self.busy or context.get('started')!=self._task_started):return
+        if context.get('source')=='dsh_progress' and context.get('job') not in self._dsh_reports:return
+        if context.get('source')=='bound':
+            current=self._dsh_monitor.status()
+            if context.get('generation')!=current.get('generation') or current.get('state') not in ('queued','running','disconnected'):return
+        if context.get('source')=='delivery':
+            if self.result_board and getattr(self.result_board,'delivery_key',None)==context.get('delivery_key'):
+                self.result_board.set_explanation(event['text']+'\n\n'+context.get('details',''))
+        self._queue_task_speech(event['key'],event['text'],context.get('terminal',False),ident,context['agent_id'])
+
+    def _begin_result_delivery(self,ident,goal,text,workspace=None,since=0,key=''):
+        from core.artifact_review import DIAGRAM
+        from core.file_delivery import wants_file,extract_paths
+        original_goal=str(goal).split('\n【已对齐要求】',1)[0]
+        if (not extract_paths(text) and re.search(r'打开|进入|点击',original_goal) and
+            not re.search(r'生成|制作|绘制|导出|下载|保存为|写入|做.*报告',original_goal)):
+            return
+        key=key or ident+'-'+str(since)
+        if key in self._delivery_seen:return
+        self._delivery_seen.add(key)
+        if not (wants_file(goal) or DIAGRAM.search(goal) or extract_paths(text)):return
+        if re.search(r'上一步|上次|已有|原有|已生成|不要重新生成',str(goal)):since=0
+        import threading
+        def work():
+            from core.artifact_review import collect
+            files=collect(text,workspace,since)
+            self.artifact_ready.emit(dict(ident=ident,goal=goal,text=text,files=files,key=key))
+        threading.Thread(target=work,name='guga-artifact-review',daemon=True).start()
+
+    def _deliver_artifacts(self,event):
+        ident=event['ident'];files=event['files']
+        details='\n'.join(('已检查：' if x.get('readable') else '未通过检查：')+x['path']+
+            ('\n  '+'；'.join(x.get('checks',[])) if x.get('readable') else '\n  '+x.get('error','文件未确认')) for x in files)
+        if not files:details='尚未拿到本次可读取的最终文件，不能把文字答复当成文件已经交付。'
+        self.store.append(ident,'assistant',details)
+        if ident!=self.active_id:return
+        from ui.result_board import ResultBoard
+        if self.result_board is None:self.result_board=ResultBoard(self.pet)
+        # Prefer the actual figure over its companion notes.
+        files=sorted(files,key=lambda x:0 if x.get('preview_kind')=='html' else 1 if x.get('preview_kind') in ('image','pdf') else 2)
+        self.result_board.delivery_key=event['key']
+        self.result_board.present(event['goal'],files,details+'\n\n本鹅正在根据文件内容整理说明。')
+        first=next((i for i,x in enumerate(files) if x.get('readable')),None)
+        opened=False
+        if first is not None:
+            self.result_board.list.setCurrentRow(first)
+            opened=self.result_board.open_selected()
+        facts=dict(goal=event['goal'],executor_claim=event['text'][:1200],
+                   file_checks=[{k:v for k,v in x.items() if k in ('name','checks','error','readable','excerpt')} for x in files],
+                   open_requested=opened,application_render_verified=False,independent_task_acceptance=False)
+        facts['embedded_html']=bool(self.result_board.open_receipt.get('embedded'))
+        facts['display_location']='咕嘎成果黑板' if facts['embedded_html'] else '外部文件应用'
+        embedded=bool(self.result_board.open_receipt.get('embedded'))
+        fallback=('最终文件的路径已列在黑板上，我已读取其中内容。'+('网页正在黑板内展开，可以直接操作。' if opened and embedded else '也已请求电脑打开第一份文件。' if opened else '文件未能自动打开，可以在黑板上点开。')) if first is not None else details
+        self._request_public_report('delivery-'+event['key'],facts,fallback,ident,source='delivery',terminal=True,
+                                    delivery_key=event['key'],details=details)
+        self._show_active_bubble(fallback);self.render()
+
     def render(self):
         self.refresh_companion_header()
         from core.chat_presentation import is_progress_ack
-        messages = self.store.messages(self.active_id)
+        messages = self._messages_for(self.active_id)
         hidden=[m for m in messages if m['role'] in ('tool','system') or
                 (m['role']=='assistant' and is_progress_ack(m['content']))]
         self.log_button.setText('执行记录' + (' · '+str(len(hidden)) if hidden else ''))
@@ -307,19 +612,26 @@ class AgentChatWindow(QDialog):
         if self._answer_text:visible.append(dict(id='draft',role='assistant',content=self._answer_text))
         if not visible:
             from ui.companion_widgets import ARTWORK
-            from PyQt5.QtCore import QUrl
-            artwork=QUrl.fromLocalFile(str(ARTWORK[self.active_agent_id])).toString()
-            name=html.escape(self.active_profile['display_name'])
-            address=html.escape(self.active_profile.get('user_address') or '饲养员')
-            self.view.setHtml('<div style="margin-top:40px;text-align:center;color:#303a50">'
-                '<p><img src="'+artwork+'" height="110"></p><p style="font-size:22px;font-weight:600">'+address+'，'+name+'在这里</p>'
-                '<p style="color:#8b97ac;font-size:13px;line-height:1.9">聊聊想法，解释一段文字，或交给我一件事。<br>常做的工作，可以一起写成下一次直接复用的流程。</p></div>')
+            from PyQt5.QtGui import QPixmap
+            if self.hero_art.property('agent') != self.active_agent_id:
+                dpr = self.hero_art.devicePixelRatioF()
+                portrait = QPixmap(str(ARTWORK.get(self.active_agent_id, ARTWORK['001'])))
+                portrait = portrait.scaledToHeight(round(112 * dpr), Qt.SmoothTransformation)
+                portrait.setDevicePixelRatio(dpr)
+                self.hero_art.setPixmap(portrait)
+                self.hero_art.setProperty('agent', self.active_agent_id)
+            name = self.active_profile['display_name']
+            address = self.active_profile.get('user_address') or '饲养员'
+            self.hero_title.setText(f'{address}，{name}在这里')
+            self.view.clear()
+            self.conversation_pages.setCurrentWidget(self.welcome)
             return
+        self.conversation_pages.setCurrentWidget(self.view)
         parts=[]
         self._copy_store={}
         for m in visible:
             role=m['role'];is_user=role=='user';detail=m in hidden
-            color='#edf2ff' if is_user else ('#f6f7f9' if detail else '#ffffff')
+            color='#e6f1f4' if is_user else ('#f1f5f7' if detail else 'transparent')
             who='你' if is_user else ('执行记录' if detail else self.active_profile['display_name'])
             pad='12' if not detail else '8'
             footer=''
@@ -392,7 +704,7 @@ class AgentChatWindow(QDialog):
 
     def _toggle_sidebar(self):
         show=self.sidebar.isHidden();self.sidebar.setVisible(show)
-        self.resize(max(720,self.width()+210) if show else max(480,self.width()-210),self.height())
+        self.header_new.setVisible(not show)
         self.history_button.setChecked(show)
 
     def attach_screenshot(self,image_url):
@@ -407,9 +719,31 @@ class AgentChatWindow(QDialog):
     def _screen_tool(self,mode):
         self.pet._screen_tools.begin(mode)
 
+    def ask_screen(self, image_url):
+        """Read the explicit snapshot without consuming the open draft or routing a task."""
+        if self.busy or self.answer.active or self._fast_inflight:
+            self.status.setText('请等当前操作结束，再次选择「看屏幕」')
+            return False
+        prompt = ('请根据这张刚截取的桌面图片简洁回答：当前是什么界面，'
+                  '正在发生什么，有哪些值得留意的画面细节？看不清的内容请直说。')
+        try:
+            self.answer.start(self.active_id, [], prompt, image_url=image_url,
+                              profile=self.active_profile, screen_snapshot=True)
+        except Exception as exc:
+            self.status_error('看屏幕未完成：' + str(exc))
+            return False
+        self._begin_turn('answer')
+        self.store.append(self.active_id, 'user', '[桌面截图] 看屏幕')
+        if self.store.conversation(self.active_id)['name'] == '新对话':
+            self.store.rename('conversation', self.active_id, '看屏幕')
+        self.status.setText('正在分析当前桌面…')
+        self.refresh_tree()
+        self.render()
+        return True
+
     def _shortcut_help(self):
         failed=getattr(self.pet._screen_tools,'hotkey_errors',[])
-        QMessageBox.information(self,'快捷操作','在支持读取文字选区的软件里选中文字，鼠标旁出现「解释 / 截图分析」。\nCtrl+Alt+A 或「截图」：截取当前屏幕并直接发给模型。\nCtrl+Alt+E：直接解释当前选词。\n更多菜单保留框选截图和框选识字。\n临时解释不加入聊天记录，右下角可调整对话窗大小。'+('\n快捷键已被其他软件占用：'+', '.join(failed)+'；可使用窗口按钮。' if failed else ''))
+        QMessageBox.information(self,'快捷操作','右键咕嘎或按 Ctrl+Alt+A，截取当前屏幕交给视觉模型分析。\nCtrl+Alt+E：解释当前选词。\n输入框下方的「工具」可以框选截图、框选识字或打开划词工具条。\nEnter 发送，Shift+Enter 换行。'+('\n快捷键已被其他软件占用：'+', '.join(failed) if failed else ''))
 
     def _log_link(self, url):
         scheme=url.scheme()
@@ -454,7 +788,131 @@ class AgentChatWindow(QDialog):
         if self.busy or self.voice_active:
             return
         self.show_archived = False
+        if getattr(self,'_manager_enabled',False):
+            cid=self.managed.create('guga',project_id=self._project_selection(),agent_id=self.active_agent_id)
+            self.open_conversation(cid);return
         self.open_conversation(self.store.create_conversation(project_id=self._project_selection(),agent_id=self.active_agent_id))
+
+    def toggle_executor_view(self):
+        self._executor_view=not self._executor_view
+        self.managed.refresh(self.active_id);self.render()
+
+    def open_executor(self):
+        row=self.managed.get(self.active_id)
+        if row['backend']=='guga':
+            self.status.setText('当前是咕嘎自己的对话。选择 Codex 或 DSH 后交代任务，执行时自动连接并沿用当前对话。')
+            return
+        if not row['external_id']:
+            self.managed.provision(self.active_id);self.status.setText('正在创建真实执行器对话…');return
+        if row['backend']=='codex':self.runtime.codex.execute(dict(action='open'),self.active_id,self.active_agent_id)
+        else:
+            from PyQt5.QtGui import QDesktopServices
+            from PyQt5.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl('http://127.0.0.1:3080'))
+
+    def recover_pending_draft(self):
+        row=self.managed.get(self.active_id)
+        text=str(row.get('undelivered_pending') or '')
+        if not text:
+            self.status.setText('这个对话没有保留的未发送要求。');return
+        if self.editor.toPlainText().strip():
+            self.status.setText('输入框已有草稿，未覆盖。');return
+        self.editor.setPlainText(text)
+        self.status.setText('上次未发出的要求已恢复到输入框；检查后点发送，不会自动投递。')
+
+    def _managed_update(self,event):
+        worker_cid=event['cid'];kind=event['type'];row=self.managed.get(worker_cid)
+        cid=row.get('dispatch_parent') or worker_cid
+        if kind=='fish_report':
+            team=getattr(self.pet,'_multi_agent',None)
+            if team:team.say('002',event['text'])
+            self.store.append(cid,'assistant','肥鱼：'+event['text'])
+            if cid==self.active_id:self.render()
+            return
+        if kind=='history':
+            if cid==self.active_id:self.render()
+            return
+        label=row['backend'].upper();text=str(event.get('text') or '')
+        if kind in ('progress','dispatched','review_started'):
+            self._managed_motion(worker_cid,'waiting' if event.get('state')=='needs_input' else 'working',row.get('goal',''))
+        elif kind in ('completed','review_completed','error','task_failed','stopped'):
+            self._managed_motion(worker_cid,'error' if kind in ('error','task_failed') else 'idle')
+        if kind=='connected':line=label+' 的真实对话已连接，可以直接交代任务。'
+        elif kind=='error':line='这次连接或派单没有确认：'+text
+        elif kind=='task_failed':
+            line=('操作结果待核对：' if event.get('state')=='delivery_unknown' else '任务没有完成：')+text
+        elif kind=='dispatched':line='肥鱼已把任务交给 DSH，正在等实际结果。'
+        elif kind=='progress':
+            if not text:return
+            line=label+' · '+short_bubble_text(text)
+        elif kind=='review_started':line='执行器已返回。我已经另开 Codex 对话做独立验收，验收后再给你结论。'
+        elif kind=='review_completed':
+            status=event['verdict'];line={'passed':'独立验收已通过。','failed':'独立验收发现问题，结果暂不算完成。',
+                'needs_input':'验收还需要补充信息。','unverified':'这次没有拿到有效的独立验收结论。'}.get(status,'验收尚未确认。')
+        elif kind=='completed':line=label+' 已返回结果。'+(' '+short_bubble_text(text) if text else '')
+        elif kind=='stopped':line='已停止当前任务。'+text
+        else:return
+        self.store.append(cid,'assistant',line)
+        if cid==self.active_id:
+            self.status.setText(line);self._show_active_bubble(line);self.render()
+            self.stop_button.setEnabled(bool(self.busy or self._codex_running() or self.runtime.music.requested))
+        if kind in ('progress','completed','review_completed'):
+            facts=dict(goal=row.get('goal'),executor=label,state=row['state'],executor_report=text[:4500],
+                independent_review=event.get('verdict','pending' if row.get('needs_review') else 'not_requested'))
+            self._request_public_report('pm-'+cid+'-'+kind+'-'+str(hash(text)),facts,line,cid,source='manager',terminal=kind!='progress')
+        if kind in ('completed','review_completed'):
+            from core.file_delivery import extract_paths, wants_file
+            result=row.get('result') or text
+            workspace = self.runtime.codex.bound(worker_cid).get('cwd') if row.get('project_plan_turn') else ''
+            if row.get('project_plan_turn') and kind == 'completed' and worker_cid == self.active_id:
+                self.pet._perform_gesture('wave')
+            if wants_file(row.get('goal','')) or extract_paths(result):
+                self._begin_result_delivery(cid,row.get('goal',''),result,workspace or str(Path(__file__).resolve().parents[1]),
+                    row.get('started_at',0),'pm-result-'+cid+'-'+str(row.get('delivered_turn','')))
+        if row['backend']=='dsh' and kind=='dispatched':
+            team=getattr(self.pet,'_multi_agent',None)
+            if team:
+                self.pet._show_agent_bubble('肥鱼，这项任务交给你。执行到哪一步、有缺什么，及时告诉我。',cid)
+                QTimer.singleShot(600,lambda:team.say('002','报告咕嘎指挥员，DSH 已收到任务。我会按真实进度汇报，需要补充时再找你。'))
+
+    def _managed_motion(self,cid,state,text=''):
+        anim=getattr(self.pet,'_anim2d',None)
+        if anim is None:return
+        anim.work_activity='drawing' if re.search(r'画图|绘图|画一|画个|绘制|插画|设计图',text) else 'working'
+        anim.set_work_state(state,'managed:'+cid)
+
+    def _managed_codex_command(self,command,text,record_user,read_reply=False,image=None):
+        if record_user:self.store.append(self.active_id,'user',text)
+        accepted=True
+        try:
+            if image:raise ValueError('截图已保留，当前 Codex 通道请使用文字任务。')
+            cid=self.active_id;action=command['action']
+            row=self.managed.get(cid)
+            if row['backend']!='codex':
+                if action not in ('start','send','open'):
+                    raise ValueError('当前对话尚未绑定 Codex 任务。')
+                cid=self.managed.target(cid,'让 Codex '+command.get('text',''),backend='codex');row=self.managed.get(cid)
+            if action in ('start','send'):
+                task=command.get('text','').strip()
+                if not task:raise ValueError('请补充要交给 Codex 的任务。')
+                self.managed.send(cid,task);self._managed_motion(cid,'thinking',task)
+                reply='已交给 Codex 规划执行，进度和追加要求都在原对话里。'
+            elif action=='open':
+                if row['external_id']:self.runtime.codex.execute(dict(action='open'),cid,row['agent_id'])
+                else:self.managed.provision(cid)
+                reply='已请求打开 Codex 并连接当前对话。'
+            elif action=='stop':
+                self.managed.stop(cid);reply='已请求停止当前 Codex 任务，等待真实回执。'
+            else:
+                self.managed.refresh(cid)
+                reply='Codex · '+CODEX_STATES.get(row['state'],row['state'])+'。'+str(row.get('result') or row.get('error') or '')[:500]
+        except Exception as exc:reply=str(exc)[:400];accepted=False
+        self._last_personal_answer=reply
+        self.store.append(self.active_id,'tool',reply);self.status.setText(reply);self._show_active_bubble(reply)
+        if read_reply:self._say_active_reply(reply,speak=True)
+        self.editor.clear();self.render()
+        self.stop_button.setEnabled(bool(self.busy or self._codex_running() or self.runtime.music.requested))
+        return accepted
 
     def activate_agent(self,agent_id):
         """Switch this shared workspace to one member's isolated conversations."""
@@ -479,7 +937,16 @@ class AgentChatWindow(QDialog):
         for ident,button in getattr(self,'member_buttons',{}).items():
             button.setChecked(ident==self.active_agent_id)
         if hasattr(self,'model_label'):
-            self.model_label.setText(self.active_profile['display_name']+' · '+self.active_profile['role']+'  /  记住习惯，陪你把事情做好')
+            if getattr(self,'_manager_enabled',False) and self.active_id:
+                row=self.managed.get(self.active_id)
+                mode=self.pet._config._s.value('team/executor','self')
+                label={'self':'咕嘎处理','codex':'Codex','dsh':'DSH'}.get(mode,'咕嘎处理')
+                binding=('  ·  已绑定 '+row['backend'].upper()) if row['external_id'] else ''
+                self.model_label.setText('任务执行 · '+label+binding)
+                self.executor_open.setVisible(row['backend'] in ('codex','dsh'))
+                self.executor_history.setVisible(bool(row['external_id']))
+            else:self.model_label.setText(self.active_profile['role'])
+            self.model_label.setToolTip(self.model_label.text())
 
     def open_companion_settings(self,agent_id=None,tab=0):
         from ui.companion_settings import CompanionSettings
@@ -550,8 +1017,14 @@ class AgentChatWindow(QDialog):
             if event.type()==QEvent.MouseMove and self._window_drag_pos is not None and event.buttons() & Qt.LeftButton:
                 self.move(event.globalPos()-self._window_drag_pos);return True
             if event.type()==QEvent.MouseButtonRelease:self._window_drag_pos=None
-        if obj is getattr(self,'editor',None) and event.type() == QEvent.KeyPress:
-            if event.key() in (Qt.Key_Enter, Qt.Key_Return) and not event.modifiers() & Qt.ShiftModifier:
+        if obj is getattr(self,'editor',None):
+            if event.type() in (QEvent.FocusIn, QEvent.FocusOut):
+                self.composer.setProperty('editing', event.type() == QEvent.FocusIn)
+                self.composer.style().unpolish(self.composer)
+                self.composer.style().polish(self.composer)
+                self.composer.update()
+            if (event.type() == QEvent.KeyPress and event.key() in (Qt.Key_Enter, Qt.Key_Return)
+                    and not event.modifiers() & Qt.ShiftModifier):
                 self.send()
                 return True
         return super().eventFilter(obj, event)
@@ -592,6 +1065,135 @@ class AgentChatWindow(QDialog):
             facts.append(self.runtime.companion_memory.context(self.active_agent_id,'每日计划',self.active_id))
         return facts
 
+    def _codex_bound(self):
+        manager=getattr(self.runtime,'codex',None)
+        bound=manager.bound(self.active_id) if manager is not None else {}
+        if bound and str(bound.get('agent_id') or self.active_agent_id)!=self.active_agent_id:return {}
+        return bound or {}
+
+    def _codex_running(self):
+        if getattr(self,'_manager_enabled',False):
+            row=self.managed.get(self.active_id)
+            return row['backend']=='codex' and row['state'] in ('connecting','dispatching','running','needs_input','stop_requested')
+        task=getattr(self,'_codex_tasks',{}).get((self.active_id,self.active_agent_id)) or self._codex_bound()
+        return bool(task and not task.get('terminal') and task.get('state') not in
+                    ('idle','completed','failed','cancelled','canceled','stopped','interrupted','closed'))
+
+    def _handle_codex_command(self,text,record_user,force_agent=False,read_reply=False,image=None):
+        command=codex_command(text)
+        if command is not None and getattr(self,'_manager_enabled',False):
+            return self._managed_codex_command(command,text,record_user,read_reply,image)
+        from core.execution_contract import is_dsh_live_query
+        if command is None and is_dsh_live_query(text):return None
+        bound=self._codex_bound()
+        backend=self.store.preference('execution_backend') or 'auto'
+        if command is None and not image and (bound or backend=='codex') and backend not in ('self','dsh'):
+            from core.chat_answer import uses_task
+            from core.companion_dialogue import is_task_followup,is_task_status
+            if bound and is_task_status(text) and not uses_task(text,'auto'):
+                command=dict(action='status')
+            elif bound and re.fullmatch(r'(?:停止|取消|中止)(?:当前)?(?:任务|执行)?[。！!\s]*',text):
+                command=dict(action='stop')
+            elif force_agent or uses_task(text,'auto') or (bound and is_task_followup(text)):
+                command=dict(action='send' if bound else 'start',text=text)
+        if command is None:return None
+        action=command['action'];reply=''
+        if record_user:self.store.append(self.active_id,'user',text)
+        if image:
+            reply='当前 Codex 桌面端入口只支持文字任务；截图已保留，请另发文字指令。'
+        elif action in ('start','send') and not command.get('text'):
+            reply='请补充要交给 Codex 桌面端的具体任务。'
+        elif len(command.get('text',''))>16000:
+            reply='单条 Codex 任务最多 16000 字，请分段发送。'
+        else:
+            try:
+                result=self.runtime.execute('codex_task',command)
+                if result.get('ok') is False or result.get('accepted') is False:
+                    reply='Codex 请求未受理：'+str(result.get('error') or result.get('message') or '请检查桌面端连接')
+                elif action in ('status','list'):
+                    if action=='status':reply=codex_status_text(result)
+                    else:reply='\n'.join(codex_status_text(dict(task=row)) for row in result.get('tasks',[])) or '暂无 Codex 任务。'
+                else:
+                    reply={'start':'Codex 任务已受理，等待后台执行与状态确认；受理不代表完成。',
+                           'send':'追加要求已受理，等待 Codex 执行；尚未完成。',
+                           'open':'已请求打开绑定的 Codex 对话，等待桌面端确认。',
+                           'stop':'已请求 Codex 停止任务，等待真实状态确认。'}[action]
+                    if action in ('start','send','stop'):
+                        tasks=getattr(self,'_codex_tasks',{})
+                        previous=tasks.get((self.active_id,self.active_agent_id),{})
+                        tasks[(self.active_id,self.active_agent_id)]=dict(previous,
+                            thread_id=result.get('thread_id') or bound.get('thread_id') or '',
+                            state='stop_requested' if action=='stop' else 'queued',summary=reply,terminal=False)
+                        self._codex_tasks=tasks
+            except Exception as exc:
+                reply='Codex 请求未受理：'+str(exc)[:240]
+        self.store.append(self.active_id,'tool','Codex · '+reply)
+        self._last_personal_answer=reply
+        self.status.setText(short_bubble_text(reply,120))
+        self._show_active_bubble(short_bubble_text(reply))
+        if read_reply:self._say_active_reply(short_bubble_text(reply),speak=True)
+        self.stop_button.setEnabled(bool(self.busy or self._codex_running() or self.runtime.music.requested))
+        self.editor.clear();self.render()
+        return True
+
+    def _stop_codex(self):
+        if getattr(self,'_manager_enabled',False):
+            row=self.managed.get(self.active_id)
+            if row['backend']=='codex' and row['state'] in ('connecting','dispatching','running','needs_input','stop_requested'):
+                try:return self.managed.stop(self.active_id)
+                except Exception as exc:return dict(ok=False,error=str(exc)[:400])
+            return None
+        bound=self._codex_bound()
+        if not bound:return None
+        try:
+            result=self.runtime.codex.execute(dict(action='stop',thread_id=bound.get('thread_id','')),
+                conversation_id=self.active_id,agent_id=self.active_agent_id)
+        except Exception as exc:result=dict(ok=False,error=str(exc)[:240])
+        return result
+
+    def _offer_alignment(self,text,record_user=True,**kwargs):
+        from core.chat_answer import uses_task
+        if not kwargs.get('force_agent') and not uses_task(text,self.route_combo.currentData(),False):return False
+        from core.task_alignment import choices_for
+        options=choices_for(text) if self._alignment_enabled else None
+        if not options or self.route_combo.currentData()=='chat':return False
+        if self._pending_alignment:
+            self.status.setText('请先选择当前任务方向，或发送“取消”后提出新任务');return True
+        self._pending_alignment=dict(ident=self.active_id,text=text,options=options,kwargs=kwargs)
+        if record_user:self.store.append(self.active_id,'user',text)
+        message='先选一个方向：1 '+options[0][0]+'；2 '+options[1][0]+'；3 补充要求。'
+        self.store.append(self.active_id,'assistant',message)
+        self.pet._agent_bubble.show_alignment(self.active_id,text,options)
+        self.status.setText('等待选择方向 · 尚未派单');self.editor.clear();self.render();return True
+
+    def _choose_alignment(self,ident,choice,supplement=''):
+        pending=self._pending_alignment
+        if not pending or pending['ident']!=ident or ident!=self.active_id or self.busy:return False
+        if choice not in (0,1,2,3):return False
+        if choice==3 and not str(supplement).strip():
+            self.pet._agent_bubble._choose_alignment(3);return True
+        if len(str(supplement))>3000:return False
+        self._pending_alignment=None;self.pet._agent_bubble.clear_alignment(ident)
+        if choice==0:
+            self.status.setText('已取消，未派单');self._show_active_bubble('好，这次先不执行。');return True
+        addition=pending['options'][choice-1][1] if choice in (1,2) else str(supplement).strip()
+        self.store.append(ident,'user','选择：'+(pending['options'][choice-1][0] if choice in (1,2) else '补充要求')+'\n'+addition)
+        kwargs=dict(pending['kwargs']);context=dict(kwargs.pop('execution_context',None) or {},_alignment_approved=True)
+        return self.send(pending['text']+'\n【已对齐要求】'+addition,record_user=False,execution_context=context,**kwargs)
+
+    def _open_staged_task(self, text):
+        from core.project_review import is_design_only
+        from core.fast_commands import command_text
+        normalized = command_text(text)
+        if re.search(r'不要|别去|别发|取消|上次|为什么', normalized):
+            # "不要动手写代码" is part of the explicit design-only instruction.
+            if not is_design_only(normalized):
+                return ''
+        if is_design_only(normalized):
+            self.pet._show_project_review(text)
+            return '已打开项目黑板，等方案预审通过后再下发开发。'
+        return ''
+
     def send(self, text=None, record_user=True, force_agent=False, execution_context=None, use_attachment=None,read_reply=False,_skip_local=False):
         text = text if isinstance(text, str) else self.editor.toPlainText().strip()
         image=self._pending_image if (record_user if use_attachment is None else use_attachment) else None
@@ -603,12 +1205,59 @@ class AgentChatWindow(QDialog):
             execution_context=dict(execution_context or {},_user_image_url=image)
         if not text.strip():
             return
+        command = re.sub(r'[。！!\s]+$', '', text.strip())
+        if (record_user or read_reply) and not image and command in ('更新仓库', '更新插件仓库'):
+            self.pet._open_plugin_market(refresh=True)
+            self.editor.clear()
+            return True
+        if (record_user or read_reply) and not image and command in (
+                '开启文件传输助手自动回复', '停止文件传输助手自动回复'):
+            inbox = self.runtime.file_assistant
+            line = inbox.enable() if command.startswith('开启') else inbox.stop()
+            self.status.setText(line)
+            self.pet._show_agent_bubble(line, self.active_id)
+            self.editor.clear()
+            return True
+        staged = self._open_staged_task(text) if not image else ''
+        if staged:
+            if record_user:
+                self.store.append(self.active_id, 'user', text)
+            self.status.setText(staged)
+            self.editor.clear()
+            self._show_active_bubble(staged)
+            self.render()
+            return True
+        if getattr(self,'_pending_alignment',None) and not (execution_context or {}).get('_alignment_approved'):
+            from core.task_alignment import reply_choice
+            choice,supplement=reply_choice(text)
+            if choice is not None:
+                accepted=self._choose_alignment(self.active_id,choice,supplement)
+                if accepted:self.editor.clear()
+                return accepted
         if record_user:self._last_user_activity=time.monotonic()
         self._last_personal_answer=None
+        if not image:
+            daily_command = self.runtime.daily_plan.conversation_command(text,self.active_id)
+            if daily_command:
+                if record_user:self.store.append(self.active_id,'user',text)
+                self._fast_command(dict(matched=True,action='daily_plan',arguments=daily_command,
+                                        source_text=text,_read_reply=bool(read_reply)))
+                self.editor.clear();self.render();return True
+            if record_user:self.runtime.daily_plan.clear_reminder(self.active_id)
         # Explicit user memory/review controls are local, with no model/API round trip.
-        if not image and not self.busy and self._personal_command(text,record_user):
+        if not image and (not self.busy or execution_backend_command(text)) and self._personal_command(text,record_user):
             if read_reply:self._say_active_reply(self._last_personal_answer,speak=True)
             self.editor.clear();self.render();return True
+        if getattr(self,'_manager_enabled',False) and re.search(r'肥鱼.*(?:进展|进度|汇报|怎样|怎么样)',text):
+            try:
+                self.managed.report_fish(self.active_id)
+                if record_user:self.store.append(self.active_id,'user',text)
+                self.pet._show_agent_bubble('肥鱼，你目前这个任务进行得怎样？把真实进展和需要补充的地方告诉我。',self.active_id)
+                self.editor.clear();return True
+            except Exception as exc:self.status.setText(str(exc));return False
+        if not getattr(self,'_manager_enabled',False) or codex_command(text) is not None:
+            codex_result=self._handle_codex_command(text,record_user,force_agent,read_reply,image)
+            if codex_result is not None:return codex_result
         memory_context=''
         if record_user:
             self._remember_dialogue(self.active_agent_id,'user',text)
@@ -639,7 +1288,7 @@ class AgentChatWindow(QDialog):
             self._fast_command(fast)
             self.editor.clear();self.render()
             return True
-        if self._fast_inflight:
+        if self._fast_inflight or getattr(self,'_fast_launch_count',0):
             self.status.setText('页面关闭操作正在核验，请稍候；本次没有启动另一项桌面任务')
             return False
         if self.busy:
@@ -678,16 +1327,93 @@ class AgentChatWindow(QDialog):
         if len(text) > 16000:
             self.status.setText('单条消息最多 16000 字，请分段发送')
             return
-        history = self.store.messages(self.active_id, 40)
-        from core.chat_answer import uses_task,LEVELS
+        from core.companion_policy import read_policy, workbuddy_prompt
         from core.daily_workflows import workflow_for
         from core.task_router import choose_task_route
+        from core.wechat_demo import explicit_message
+        policy = read_policy(self.pet._config._s)
+        workflow = self.runtime.workflows.match(text) or workflow_for(text)
+        direct_request=record_user or read_reply or (execution_context or {}).get('_direct_user_request')
+        message = explicit_message(text) if direct_request and not image and not _skip_local else None
+        if message is None and not image and re.match(
+                r'^(?:(?:咕嘎|请你?|帮我)[，,\s]*)*(?:在微信|用微信|打开微信|(?:给|向)?文件传输助手).*(?:发送|发给|发消息|回复)', text):
+            line = '请把联系人名称和要发送的原文一起告诉我，例如“在微信里给文件传输助手发送：你好”。'
+            if record_user:self.store.append(self.active_id,'user',text)
+            self.store.append(self.active_id,'assistant',line)
+            self.status.setText(line);self._show_active_bubble(line);self.editor.clear();self.render()
+            return True
+        workbuddy = workbuddy_prompt(text, policy) if direct_request and not image and not _skip_local and message is None else ''
+        if (not workbuddy and not message and not image and not workflow and policy['executor']=='workbuddy'
+                and not re.search(r'(?:不要|不用|别用)\s*work\s*buddy', text, re.I)):
+            from core.chat_answer import uses_task
+            if force_agent or uses_task(text,self.route_combo.currentData()):
+                workbuddy = text
+        if not workbuddy and not getattr(self,'_manager_enabled',False) and not image and not (execution_context or {}).get('_alignment_approved'):
+            if self._offer_alignment(text,record_user,force_agent=force_agent,execution_context=execution_context,
+                                     use_attachment=use_attachment,read_reply=read_reply,_skip_local=_skip_local):return True
+        if not workbuddy and getattr(self,'_manager_enabled',False):
+            from core.chat_answer import uses_task
+            from core.companion_dialogue import is_task_followup,is_task_status
+            from core.companion_policy import selected_backend
+            row=self.managed.get(self.active_id)
+            followup=row['backend'] if row.get('goal') and is_task_followup(text) and not workflow and not message else 'self'
+            backend=selected_backend(text,policy,followup,workflow=workflow)
+            if message and backend!='dsh':
+                backend='self'
+            if is_task_status(text) and row.get('goal'):
+                self.managed.refresh(self.active_id)
+                line='正在核对 '+row['backend'].upper()+' 的真实进度；当前状态：'+row['state']
+                self.store.append(self.active_id,'user',text);self.store.append(self.active_id,'assistant',line)
+                self._show_active_bubble(line);self.editor.clear();self.render();return True
+            if backend in ('codex','dsh') and (message or force_agent or uses_task(text,self.route_combo.currentData(),bool(image)) or (row.get('goal') and is_task_followup(text))):
+                if image:
+                    self.status.setText('截图已保留；目前执行器通道需要文字要求，请补充要处理的内容');return False
+                try:
+                    target=self.managed.target(self.active_id,text,backend=backend)
+                    accepted=self.managed.send(target,text)
+                    row=self.managed.get(target)
+                    self.refresh_companion_header()
+                    self._managed_motion(target,'thinking',text)
+                    if record_user:self.store.append(self.active_id,'user',text)
+                    self.status.setText('已交给 '+row['backend'].upper()+'，等待真实回执')
+                    self._show_active_bubble('我来跟进，这项任务交给 '+row['backend'].upper()+' 执行。')
+                    self.stop_button.setEnabled(True)
+                    self.editor.clear();self.render();return bool(accepted)
+                except Exception as exc:
+                    self.status.setText(str(exc));self._show_active_bubble(str(exc));return False
+        # 2026-11-12：这个对话绑定了真实的 DSH 会话，就把话直接投进那个会话。
+        # 这才是「打开咕嘎的对话就是开启 DSH」——不是另起一个任务，而是接着
+        # 那个会话继续说；DSH 网页端看到的也是同一条对话。
+        #
+        # 但**闲聊不进 DSH**（第 3 步的闸门）：说一句「在吗」也要开一次会话，
+        # 既慢又烧钱。所以只有真的要动手的话才投给 DSH，其余落到下面的本地路径。
+        bound = ''
+        try:
+            bound = str(self.store.conversation(self.active_id).get('dsh_session_id') or '').strip()
+        except Exception:
+            bound = ''
+        direct_dsh=self.store.preference('execution_backend') not in ('self','codex')
+        if direct_dsh and bound and not image and not workbuddy and not workflow and not message:
+            from core.chat_answer import uses_task as _uses_task
+            _is_work = bool(force_agent or _uses_task(text, self.route_combo.currentData(), False))
+            if _is_work:
+                if record_user:
+                    self.store.append(self.active_id, 'user', text)
+                self.editor.clear()
+                return self._send_to_bound_dsh(self.active_id, bound, text)
+        # 未绑定的新对话绝不在这里"当场开一个 DSH 会话"：那会绕过下面的
+        # choose_task_route，把本该本地执行的任务（搜索/整理/日常操作）也
+        # 推给 DSH，还会在测试里真的去连网关。执行者只由 route 决定。
+        history = self.store.messages(self.active_id, 40)
+        from core.chat_answer import uses_task,LEVELS
         from core.task_feedback import EvidenceProgress
-        workflow=self.runtime.workflows.match(text) or workflow_for(text)
-        task=force_agent or uses_task(text,self.route_combo.currentData(),bool(image)) or bool(workflow and self.route_combo.currentData()!='chat')
-        from core.personal_harness import use_dsh
+        task=bool(workbuddy or message) or force_agent or uses_task(text,self.route_combo.currentData(),bool(image)) or bool(workflow and self.route_combo.currentData()!='chat')
         backend=self.store.preference('execution_backend') or 'auto'
-        route=choose_task_route(text,bool(image),backend,workflow) if task else None
+        route=choose_task_route(text,bool(image),backend,workflow) if task and not workbuddy else None
+        if workbuddy:
+            route = dict(executor='workbuddy', category='desktop_partner', reason='使用 WorkBuddy 桌面对话')
+        elif message:
+            route = dict(executor='local_agent', category='wechat', reason='咕嘎直接执行已明确的微信发送要求')
         dsh=bool(route and route.get('executor')=='dsh')
         self._active_workflow=workflow if task else None
         self._active_route=route
@@ -717,27 +1443,24 @@ class AgentChatWindow(QDialog):
                     self._dsh_reports[job_id]=dict(agent_id=self.active_agent_id,
                         conversation_id=self.active_id,reporter=EvidenceProgress(interval=30),
                         brief=DshTaskBrief(job_id,text),started=time.monotonic(),wait_talks=[])
-                else:self.agent.start(self.active_id,history,text,handoff=handoff)
+                else:
+                    if workbuddy:
+                        handoff.update(_workbuddy_prompt=workbuddy, _desktop_lock=self.runtime.external_desktop_lock)
+                    elif message:
+                        handoff.update(_wechat_message=message, _desktop_lock=self.runtime.external_desktop_lock)
+                    self.agent.start(self.active_id,history,text,handoff=handoff)
         except Exception as exc:
             self.status.setText(str(exc))
             self._active_workflow=None;self._active_route=None;self._active_task_text=''
             return False
-        self.busy = True
-        self._run_kind='dsh' if dsh else 'task' if task else 'answer';self._answer_text=''
-        self.pet._multi_agent.work_state(self.active_agent_id,'thinking','turn:'+self.active_id)
+        self._begin_turn('dsh' if dsh else 'task' if task else 'answer')
         if image:self._clear_attachment()
-        self.pet._tts.stop()
         if record_user:
             self.store.append(self.active_id, 'user', ('[本轮截图]\n' if image else '')+text)
         if self.store.conversation(self.active_id)['name'] == '新对话':
             self.store.rename('conversation', self.active_id, text.replace('\n', ' ')[:24])
         self.editor.clear()
-        self.send_button.setEnabled(True)
-        self.new_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
         self.status.setText('DSH 正在执行 · 可查看执行记录' if dsh else '正在执行任务…' if task else ('正在回答…' if self.effort_combo.currentData()=='quick' else '思考中 · '+LEVELS[self.effort_combo.currentData()][0]))
-        self._task_started=time.monotonic()
-        self._last_task_notice=self._task_started
         self._task_summary='正在规划第一步，尚未修改目标文件'
         if task:
             self._task_reporter=None if dsh else EvidenceProgress()
@@ -746,6 +1469,17 @@ class AgentChatWindow(QDialog):
         self.refresh_tree()
         self.render()
         return True
+
+    def _begin_turn(self, kind):
+        self.busy = True
+        self._run_kind = kind
+        self._answer_text = ''
+        self._task_started = self._last_task_notice = time.monotonic()
+        self.pet._multi_agent.work_state(self.active_agent_id, 'thinking', 'turn:' + self.active_id)
+        self.pet._tts.stop()
+        self.send_button.setEnabled(True)
+        self.new_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
 
     def _question_waiting(self,read_aloud=False):
         from core.companion_dialogue import question_opener
@@ -786,12 +1520,17 @@ class AgentChatWindow(QDialog):
             self._voice_readback=True
             voice.resolve_task(context['call_id'],dict(ok=bool(result.get('ok')),answer=speech_answer(text),error=result.get('error','')))
         if ident==self.active_id and agent_id==self.active_agent_id:
+            from core.embodiment import reply_performance
+            expression, action = reply_performance(text)
+            if expression is not None:self._active_expression(expression)
+            if action != 'none':self._active_gesture(action)
             self._show_active_bubble(short_bubble_text(text));self.render()
             if not self.voice_active and context['read_aloud']:
                 from core.agent_identity import voice_preferences
                 self.pet._tts.speak(speech_answer(text),voice_profile=voice_preferences(context['profile']))
 
     def _cancel_execution(self):
+        self._stop_codex()
         self._task_speech.clear()
         if self.voice and hasattr(self.voice,'clear_task_notices'):self.voice.clear_task_notices()
         self.agent.cancel()
@@ -810,7 +1549,11 @@ class AgentChatWindow(QDialog):
         if parse_command(text):return False
         owner=self.active_agent_id;archive=self.runtime.dsh.archive
         answer=None
-        if text.startswith(('记住：','记住:','请记住：','请记住:')):
+        if text.strip() in ('打开成果黑板','查看上次成果','展开成果黑板'):
+            if self.result_board is not None:
+                self.result_board.show();self.result_board.raise_();answer='成果黑板已经展开，文件路径和说明都在里面。'
+            else:answer='这次启动后还没有可展示的成果。任务完成并拿到最终文件后，我会自动展开黑板。'
+        elif text.startswith(('记住：','记住:','请记住：','请记住:')):
             content=text.replace('：',':').split(':',1)[1].strip()
             if not content or safe_text(content)!=content:
                 answer='没有保存：记忆不能为空，也不能包含凭据或超长文本。'
@@ -876,11 +1619,12 @@ class AgentChatWindow(QDialog):
                 flow=self.runtime.workflows.activate(text.split()[-1])
                 answer='工作流“'+flow['title']+'”已启用。'
             except ValueError as exc:answer=str(exc)
-        elif text.strip() in ('切换到旧执行器','切换到本地智能体','切换到DSH执行器','切换到自动执行器'):
-            backend={'切换到旧执行器':'self','切换到本地智能体':'self','切换到DSH执行器':'dsh',
-                     '切换到自动执行器':'auto'}[text.strip()]
+        elif execution_backend_command(text):
+            backend=execution_backend_command(text)
             self.store.preference('execution_backend',backend)
-            label={'self':'本地视觉智能体','dsh':'DSH 执行器','auto':'自动路由（日常本地，代码工程 DSH）'}[backend]
+            self.pet._set_executor_mode(backend)
+            label={'self':'本地视觉智能体','dsh':'DSH 执行器','codex':'Codex 桌面端执行器',
+                   'workbuddy':'WorkBuddy 桌面端执行器','auto':'自动分工（日常咕嘎，复杂工程 Codex）'}[backend]
             answer='后续执行任务使用 '+label+'；简单命令快通道保持。'
         if answer is None:return False
         self._last_personal_answer=answer
@@ -952,9 +1696,19 @@ class AgentChatWindow(QDialog):
         if not self.short_voice.active:self.start_bubble_short_voice()
 
     def _short_transcript(self,text):
+        from core.desktop_transcript import normalize_transcript
+        text=normalize_transcript(text)
         self._manual_voice_turn=True;self._manual_resume_after=time.monotonic()+.4
         self._manual_voice_timer.start()
+        # 长语音通话中按住说话：走本地 driver + Edge 回复，通话保持不挂断。
+        # 文字不能投回通话（submit_user_text）——那会打断这通电话的上下文，
+        # 用户听到的就不是一次独立问答了。
+        if self._bubble_voice_long_call and self.voice:
+            self._bubble_voice_long_call=False;self.voice.mute(False)
         self.editor.setPlainText(text)
+        settings=getattr(getattr(self.pet,'_config',None),'_s',None)
+        if settings is not None and settings.value('experience/voice_draft',False,type=bool):
+            self.pet._open_quick_input(text);return
         self.send(text,read_reply=True)
 
     def _sync_manual_voice(self):
@@ -1010,15 +1764,12 @@ class AgentChatWindow(QDialog):
                 self._dsh_wait_comfort(ident,key)
             summary=brief.watchdog() if brief is not None else reporter.notice()
             if not summary:continue
-            if self.voice_active and self.voice and ident==self.active_id and agent_id==self.active_agent_id:
-                beat=brief.beat if brief is not None else reporter.beat
-                self.voice.set_task_context(dict(running=True,kind=self._run_kind,goal=self._active_task_text,summary=summary))
-                self.voice.notify_battleground('progress-'+key+'-'+str(beat),summary,during_task=True)
-            elif not self.voice_active:
-                beat=brief.beat if brief is not None else reporter.beat
-                if agent_id!=self.active_agent_id or ident!=self.active_id:
-                    self.pet._multi_agent.say(agent_id,summary)
-                else:self._queue_task_speech('heartbeat-'+key+'-'+str(beat),summary)
+            beat=brief.beat if brief is not None else reporter.beat
+            facts=reporter.snapshot(brief.goal if brief is not None else self._active_task_text)
+            if brief is not None:facts.update(executor_claim=brief.summary,blockers=brief.blockers)
+            self._request_public_report('heartbeat-'+key+'-'+str(self._task_started)+'-'+str(beat),facts,
+                '这一步还没有确认完成，我先核对已有结果。',ident,
+                source='dsh_progress' if brief is not None else 'local_progress',job=key,started=self._task_started)
 
     def _dsh_wait_comfort(self,ident,job):
         """First ≤5s sign of life while a DSH task is still starting.
@@ -1043,8 +1794,12 @@ class AgentChatWindow(QDialog):
         if self.voice.notify_battleground('wait-'+job+'-'+str(len(talks)+1),line,during_task=True):
             talks.append(now)
 
-    def _queue_task_speech(self,key,text,important=False):
+    def _queue_task_speech(self,key,text,important=False,conversation_id=None,agent_id=None):
         if self._task_speech.offer(key,text,important):
+            owners=getattr(self,'_task_speech_owners',{})
+            if conversation_id is not None:owners[key]=(conversation_id,agent_id)
+            pending={item['key'] for item in self._task_speech.pending}
+            self._task_speech_owners={k:v for k,v in owners.items() if k in pending}
             self._task_heartbeat_timer.start()
             self._flush_task_speech()
 
@@ -1054,6 +1809,8 @@ class AgentChatWindow(QDialog):
         # A real-time queue already waits for a break in the user's speech.
         item=self._task_speech.next(busy=speaking)
         if not item:return
+        owner=getattr(self,'_task_speech_owners',{}).pop(item['key'],None)
+        if owner is not None and owner!=(self.active_id,self.active_agent_id):return
         if use_realtime:
             self.voice.notify_battleground('task-'+item['key'],item['text'],during_task=True,persistent=item['important'])
         else:
@@ -1075,6 +1832,60 @@ class AgentChatWindow(QDialog):
             self.store.append(ident, 'tool', '战棋后台 · '+json.dumps(event,ensure_ascii=False)[:6000])
             if self.active_id == ident:
                 self.render()
+
+    def _codex_event(self,event):
+        """Manager signals arrive on the UI thread; never poll the desktop here."""
+        if getattr(self,'_codex_closing',False):return
+        if getattr(self,'_manager_enabled',False) and self.managed.codex_event(event):return
+        kind=event.get('type')
+        if kind not in ('codex_started','codex_progress','codex_completed','codex_failed'):return
+        ident=event.get('conversation_id');owner=str(event.get('agent_id') or '')
+        if not ident or not owner:return
+        try:conversation=self.store.conversation(ident)
+        except (KeyError,ValueError):return
+        if not conversation or str(conversation.get('agent_id') or '001')!=owner:return
+        tasks=getattr(self,'_codex_tasks',{});key=(ident,owner);previous=tasks.get(key,{})
+        thread=str(event.get('thread_id') or '')
+        state=str(event.get('state') or '')
+        summary=str(event.get('summary') or '').strip()
+        text=str(event.get('text') or '').strip();error=str(event.get('error') or '').strip()
+        turn_id=str(event.get('turn_id') or '')
+        signature=(kind,thread,turn_id,state,summary,text,error)
+        if previous.get('signature')==signature:return
+        if (previous.get('terminal') and previous.get('thread_id')==thread and kind=='codex_progress'
+                and state not in ('starting','stop_requested') and turn_id==previous.get('turn_id','')):return
+        terminal=state in ('completed','failed','stopped','cancelled','canceled','interrupted','aborted')
+        if not state:terminal=kind in ('codex_completed','codex_failed')
+        stopped=terminal and state in ('stopped','cancelled','canceled','interrupted','aborted')
+        if stopped:message='Codex 已确认停止。\n'+(summary or error or text)
+        elif kind=='codex_completed':message='Codex 已返回结果（待核验）：\n'+(text or summary or '未返回结果正文。')
+        elif kind=='codex_failed':
+            label='Codex 未完成' if terminal else 'Codex '+CODEX_STATES.get(state,'请求或监测异常，任务状态待确认')
+            message=label+'：\n'+(error or summary or text or '未收到有效结果。')
+        elif kind=='codex_started':message='Codex 已开始执行，尚未完成。\n'+summary
+        else:message='Codex 进度：'+(summary or text or CODEX_STATES.get(state,'等待新进度。'))
+        now=time.monotonic()
+        announce=terminal or now-previous.get('last_notice',-1000)>=30
+        tasks[key]=dict(thread_id=thread,turn_id=turn_id,state=state,summary=summary,signature=signature,
+                        terminal=terminal,last_notice=now if announce else previous.get('last_notice',-1000))
+        self._codex_tasks=tasks
+        self.store.append(ident,'assistant' if terminal else 'tool',message)
+        if ident!=self.active_id or owner!=self.active_agent_id:return
+        manager=getattr(self.pet,'_multi_agent',None)
+        if manager is not None:
+            manager.work_state(owner,'cancelled' if stopped else 'result' if kind=='codex_completed'
+                               else 'error' if kind=='codex_failed' else 'working','codex:'+(thread or ident))
+        if not self.busy:self.status.setText(short_bubble_text(message,120))
+        self.stop_button.setEnabled(bool(self.busy or self._codex_running() or self.runtime.music.requested))
+        self.render()
+        if not announce:return
+        notice=short_bubble_text(message)
+        self._show_active_bubble(notice)
+        if self.voice_active and self.voice:
+            self.voice.set_task_context(dict(running=not terminal,kind='codex',summary=notice))
+        if self.voice_active or self.read_aloud.isChecked():
+            self._queue_task_speech('codex-'+ident+'-'+str(now),notice,terminal,
+                                    conversation_id=ident,agent_id=owner)
 
     def _dsh_event(self,event):
         ident=event.get('conversation_id')
@@ -1113,7 +1924,14 @@ class AgentChatWindow(QDialog):
                 summary=item.get('summary','')
                 important=item.get('state') in ('needs_input','blocked','failed','ready') or item.get('milestone',False)
                 self.status.setText(summary[:120])
-                self._queue_task_speech(job+'-'+item.get('state','')+'-'+summary[:80],summary,important)
+                if item.get('state')=='needs_input':
+                    # Preserve the exact question/options; do not delay a decision behind narration.
+                    self._queue_task_speech(job+'-needs-input-'+summary[:80],summary,True)
+                else:
+                    self._request_public_report(job+'-'+item.get('state','')+'-'+summary[:80],
+                        dict(goal=self.runtime.dsh.state.get('goal',''),executor_claim=summary,
+                             state=item.get('state'),blockers=item.get('blockers',[]),independently_verified=False),
+                        '这一步需要核对，我先确认具体卡点。',ident,source='dsh_progress',job=job,terminal=important)
             elif item.get('type')=='status' and phase=='turn_start' and ident==self.active_id:
                 self._queue_task_speech(job+'-start','DSH 已开始处理，我会在重要步骤完成或遇到困难时告诉你。')
             self._task_heartbeat_timer.start()
@@ -1134,9 +1952,13 @@ class AgentChatWindow(QDialog):
                 self._task_speech.clear()
                 self._completed(dict(kind='dsh',conversation_id=ident,ok=ok,text=text,error=event.get('error',''),
                                      expression='normal',expression_explicit=False,action='none',needs_input=event.get('needs_input',False)))
-                if not self.voice_active:
-                    self._queue_task_speech(event['job_id']+'-done',
-                        (event.get('error') if not ok else 'DSH 已交付执行结果，请核对；'+event.get('text','')[:180]),True)
+                from core.file_delivery import extract_paths
+                if not extract_paths(event.get('text','')):
+                    self._request_public_report(event['job_id']+'-done',
+                        dict(goal=self.runtime.dsh.state.get('goal',''),executor_claim=event.get('text',''),
+                             error=event.get('error',''),execution_finished=True,independently_verified=False),
+                        '这一轮已经返回结果，我来核对具体内容。' if ok else '这次还有一步没有完成，原因已记在对话里。',
+                        ident,source='dsh_final',terminal=True)
                 ticket=self.runtime.dsh.state['ticket_id']
                 pending=self.runtime.dsh.archive.pending_inputs(ticket) if not self.runtime.dsh.stop_event.is_set() else []
                 if pending:
@@ -1159,7 +1981,7 @@ class AgentChatWindow(QDialog):
     def _music_event(self,event):
         playing=event.get('type')=='playing'
         self.music_listener.enable(bool(playing and self.voice_active))
-        self.stop_button.setEnabled(bool(self.busy or self.runtime.music.requested or self.runtime.music.preparing))
+        self.stop_button.setEnabled(bool(self.busy or self.runtime.music.requested or self.runtime.music.preparing or self._codex_running()))
         # Music owns both layers; switching appearance must not lose the stage.
         team=getattr(self.pet,'_multi_agent',None)
         companion=team.companions.get(self.active_agent_id) if team else None
@@ -1211,11 +2033,13 @@ class AgentChatWindow(QDialog):
             except Exception:pass
         self._task_control.reset()
         self._task_reporter=None
+        # 桌面空出来了：把之前被挡下的「打开X」补上
+        QTimer.singleShot(0,self._replay_pending_launch)
         if not self._dsh_reports:self._task_heartbeat_timer.stop()
         self.send_button.setEnabled(True)
         self.new_button.setEnabled(not self.voice_active)
-        self.stop_button.setEnabled(bool(self.runtime.music.requested))
-        if result.get('kind')!='answer' and self.agent.cancel_event.is_set():
+        self.stop_button.setEnabled(bool(self.runtime.music.requested or self._codex_running()))
+        if result.get('kind')!='answer' and self.agent.cancel_event.is_set() and not result.get('timed_out'):
             result = dict(result, ok=False, error='本轮已停止，已完成的操作保留在记录中')
         if was_task:
             state='idle' if result.get('needs_input') else 'cancelled' if self.agent.cancel_event.is_set() else 'success' if result.get('ok') else 'error'
@@ -1242,22 +2066,25 @@ class AgentChatWindow(QDialog):
             self._remember_dialogue(self.store.conversation(ident)['agent_id'],'assistant',result['text'],ident)
             voice_reply=(self.read_aloud.isChecked() or manual_reply) and (not self.voice_active or manual_reply) and result.get('kind')!='dsh'
             bubble=short_bubble_text(result['text'])
-            if not self.voice_active and not self.isVisible() and not voice_reply:
+            if not self.voice_active and not voice_reply:
                 self._show_active_bubble(bubble)
             self.status.setText('●  就绪')
             expression = result['expression'] if result.get('expression_explicit',result['expression']!='normal') else None
+            from core.embodiment import reply_performance
+            expression, action = reply_performance(result['text'], expression, result['action'])
             if voice_reply:
                 from core.companion_dialogue import speech_answer
                 spoken=speech_answer(result['text']) if result.get('kind')=='answer' else result['text']
-                self._say_active_reply(bubble,expression,result['action'],True,ident,spoken_text=spoken)
+                self._say_active_reply(bubble,expression,action,True,ident,spoken_text=spoken)
             else:
                 if expression is not None:self._active_expression(expression)
-                if result['action'] != 'none':
-                    if self.voice_active:self.pet._queue_voice_gesture(result['action'])
-                    else:self._active_gesture(result['action'])
+                if action != 'none':
+                    if self.voice_active:self.pet._queue_voice_gesture(action)
+                    else:self._active_gesture(action)
         else:
             detail=result.get('error', '本轮未完成')
-            self.store.append(ident, 'assistant', ('等待你的决定：' if result.get('needs_input') else '这次没有完成：')+detail)
+            prefix='结果尚待核对：' if result.get('outcome')=='unconfirmed' else '等待你的决定：' if result.get('needs_input') else '这次没有完成：'
+            self.store.append(ident, 'assistant', prefix+detail)
             # 2026-11-12：失败**不再写进长期记忆**。主人明确要求：长记忆只收
             # 经验性和长工作流，单次失败的流水账不该反复出现在后面的对话里
             # （会被旧错误拖住、答非所问）。改成归纳一条简短经验候选进"进化史"。
@@ -1266,13 +2093,23 @@ class AgentChatWindow(QDialog):
             self._show_active_bubble(result.get('error','本轮未完成'))
             if (not self.voice_active or manual_reply) and (self.read_aloud.isChecked() or manual_reply):
                 self._queue_task_speech('failure-'+result.get('task_id',ident),result.get('error','本轮未完成'),important=True)
+        from core.file_delivery import extract_paths, wants_file
+        if was_task and result.get('ok') and (wants_file(task_text) or extract_paths(result.get('text',''))):
+            since=time.time()-max(0,time.monotonic()-self._task_started) if self._task_started else time.time()
+            self._begin_result_delivery(ident,task_text,result.get('text',''),
+                self.runtime.dsh.state.get('cwd') if result.get('kind')=='dsh' else str(Path(__file__).resolve().parents[1]),
+                since,result.get('task_id') or ident+'-'+str(self._task_started))
         if self.active_id == ident:
             self.render()
 
     def stop_turn(self):
+        if self.busy and self._run_kind == 'answer':
+            self.answer.cancel()
+            return
+        codex_stop=self._stop_codex()
         self._task_speech.clear()
         self.runtime.media.stop()
-        self.pet._multi_agent.work_state(self.active_agent_id,'cancelled','turn:'+self.active_id)
+        if codex_stop is None:self.pet._multi_agent.work_state(self.active_agent_id,'cancelled','turn:'+self.active_id)
         self.answer.cancel();self.short_voice.stop(cancel=True);self.runtime.music.stop()
         self.runtime.battleground.stop()
         self.runtime.dsh.stop()
@@ -1280,8 +2117,51 @@ class AgentChatWindow(QDialog):
         self.pet._tts.stop()
         if self.voice_active:
             self.voice_button.setChecked(False)
-        self.status.setText('已请求停止 · 不再执行后续操作')
-        self.stop_button.setEnabled(self.busy)
+        if codex_stop is not None:
+            rejected=codex_stop.get('ok') is False or codex_stop.get('accepted') is False
+            self.status.setText('Codex 停止请求未受理：'+str(codex_stop.get('error') or '请查看任务状态') if rejected
+                                else '已请求 Codex 停止任务，等待真实状态确认')
+        else:self.status.setText('已请求停止 · 不再执行后续操作')
+        self.stop_button.setEnabled(bool(self.busy or self._codex_running()))
+
+    def toggle_call_screen_share(self, enabled):
+        if not enabled:
+            self._screen_share_manual_stop = True
+            self._stop_call_screen_share()
+            self.status.setText('已停止共享屏幕')
+            return
+        if not self.voice_active or not self.voice or not self.voice.connected:
+            self._set_call_share_control(False)
+            self.status.setText('通话接通后可以共享屏幕')
+            return
+        if self._native_video_call:
+            try:
+                self.runtime.screen_share.start(2, reason='seed_call', native_video=True)
+                self._set_call_share_control(True)
+                self.status.setText('正在共享前台窗口画面 · 切换到要分享的窗口')
+                self._show_active_bubble(self.status.text())
+            except Exception as exc:
+                self._set_call_share_control(False)
+                self.status_error('共享屏幕未开始：' + str(exc))
+        else:
+            self._start_call_screen_share()
+            self._set_call_share_control(bool(self.runtime.screen_share.status().get('active')))
+
+    def _set_call_share_control(self, enabled):
+        button = self.voice_share_button
+        previous = button.blockSignals(True)
+        button.setChecked(enabled)
+        button.setText('停止共享' if enabled else '共享屏幕')
+        button.blockSignals(previous)
+        bubble = self.pet._agent_bubble
+        if hasattr(bubble, 'set_screen_sharing'):
+            bubble.set_screen_sharing(enabled)
+
+    def _call_screen_failed(self, message):
+        if self.voice_active and self._native_video_call:
+            self._stop_call_screen_share()
+            self.status.setText(message)
+            self._show_active_bubble(message)
 
     def _start_call_screen_share(self):
         if os.environ.get('QT_QPA_PLATFORM')=='offscreen':
@@ -1295,6 +2175,7 @@ class AgentChatWindow(QDialog):
         try:
             state=self.runtime.screen_share.status()
             if not state.get('active'):self.runtime.screen_share.start(reason='call')
+            self._set_call_share_control(True)
         except Exception as exc:
             self._record_screen_share_failure(exc)
 
@@ -1317,6 +2198,7 @@ class AgentChatWindow(QDialog):
             if self.runtime.screen_share.status().get('active'):self.runtime.screen_share.stop()
         except Exception:pass
         self._screen_share_call_owned=False
+        self._set_call_share_control(False)
 
     def _screen_share_watchdog(self):
         if not self.voice_active or not self._screen_share_call_owned or self._screen_share_manual_stop:return
@@ -1351,7 +2233,7 @@ class AgentChatWindow(QDialog):
                 self.voice_button.setChecked(False)
                 return
             self.pet._voice_mode = False
-            from core.realtime_voice import load_settings, connection_url
+            from core.realtime_voice import load_settings, connection_url, SEED_PROVIDER
             from ui.voice_dialog import VoiceSettingsDialog
             cfg = load_settings()
             try:
@@ -1370,8 +2252,14 @@ class AgentChatWindow(QDialog):
             self._voice_readback = False
             if self.voice:
                 self.voice.deleteLater()
-            self.voice = AgentRealtimeVoice(self)
-            self.voice.screen_context_provider=self.runtime.screen_share.assist_context
+            self._native_video_call = cfg.get('provider') == SEED_PROVIDER
+            if self._native_video_call:
+                from core.seed_realtime_voice import SeedRealtimeVoice
+                self.voice = SeedRealtimeVoice(self)
+                self.voice.screen_frame_provider = self.runtime.screen_share.native_frame
+            else:
+                self.voice = AgentRealtimeVoice(self)
+                self.voice.screen_context_provider = self.runtime.screen_share.assist_context
             self.voice.screen_question_requested.connect(self._voice_screen_question)
             # Fresh call: no leftover task, browser fact or failure report from a
             # previous session. Only a task that is genuinely running right now
@@ -1417,13 +2305,14 @@ class AgentChatWindow(QDialog):
             self.interrupt_button.setEnabled(True)
             self.read_aloud.setEnabled(False)
             self.voice_button.setText('结束长对话')
-            self.pet._agent_bubble.set_call_active(True,self.active_id)
+            self.pet._agent_bubble.set_call_reconnecting(self.active_id, initial=True)
             # Capture is an auxiliary context source. Queue it for the connected
             # callback so a screen grab can never sit on the handshake path and
             # a capture failure can never abort a call that is still connecting.
-            self._screen_share_pending=True
+            self._screen_share_pending=not self._native_video_call
             self.voice.start(cfg)
-            self.proactive.start()
+            if self.voice_active:
+                self.proactive.start()
             self.voice._external_playing=self.runtime.music.playing
             self.music_listener.enable(bool(self.runtime.music.playing))
         else:
@@ -1448,6 +2337,7 @@ class AgentChatWindow(QDialog):
 
     def _voice_error(self, message):
         self._release_failed_voice()
+        self.pet._agent_bubble.set_call_active(False, self.active_id)
         message=str(message)+'；长语音已降级，仍可点击说话，使用驱动模型 + Edge TTS。'
         self.status.setText(message)
         self._show_active_bubble(message)
@@ -1575,6 +2465,35 @@ class AgentChatWindow(QDialog):
     def _voice_request(self, call_id, request):
         if not self.voice_active or self.sender() is not self.voice:
             return
+        staged = self._open_staged_task(request) if not self._pending_image else ''
+        if staged:
+            self.status.setText(staged)
+            self._show_active_bubble(staged)
+            self.voice.resolve_task(call_id, dict(ok=True, answer=staged, execution_pending=False))
+            return
+        if getattr(self,'_manager_enabled',False):
+            from core.chat_answer import uses_task
+            from core.fast_commands import match
+            if (not self._pending_alignment and not uses_task(request,'auto',bool(self._pending_image))
+                    and not match(request).get('matched') and codex_command(request) is None):
+                self._start_dialogue(request,call_id=call_id);return
+            accepted=self.send(request,record_user=False,use_attachment=True,execution_context={'_direct_user_request':True})
+            self.voice.resolve_task(call_id,dict(ok=accepted is not False,answer=self.status.text(),execution_pending=self._codex_running()))
+            return
+        if not self._pending_image and execution_backend_command(request):
+            self._personal_command(request,False)
+            self.voice.resolve_task(call_id,dict(ok=True,answer=self._last_personal_answer))
+            return
+        if self._handle_codex_command(request,False,image=self._pending_image) is not None:
+            self.voice.resolve_task(call_id,dict(ok=True,answer=self._last_personal_answer))
+            return
+        if self._pending_alignment:
+            from core.task_alignment import reply_choice
+            choice,supplement=reply_choice(request)
+            if choice is not None:
+                accepted=self._choose_alignment(self.active_id,choice,supplement)
+                self.voice.resolve_task(call_id,dict(ok=bool(accepted),answer='已按你的选择处理。' if accepted else '请在原任务对话中选择。'))
+                return
         confirmed=False
         try:
             from core.reflex import match as match_reflex
@@ -1627,7 +2546,7 @@ class AgentChatWindow(QDialog):
                 self.voice.resolve_task(call_id,dict(ok=True,answer=answer))
             elif control['action']=='cancel':
                 self._cancel_execution()
-                answer='已确认停止当前任务；已经完成的操作保留在记录中。'
+                answer='已请求停止当前任务，等待执行器确认；已经完成的操作保留在记录中。'
                 self.store.append(self.active_id,'system',answer)
                 self.voice.resolve_task(call_id,dict(ok=True,answer=answer))
             elif control['action']=='continue':
@@ -1645,26 +2564,9 @@ class AgentChatWindow(QDialog):
                 self.voice.resolve_task(call_id,dict(ok=True,
                     answer='收到，这句会作为当前任务的补充要求保留；我没有把它当成新任务，也不会中断正在执行的步骤。'))
             return
-        # Preserve the existing confirmation for complex delegated work and publishing.
-        # Everyday desktop actions go straight to the local agent.
-        if not self._pending_image and not confirmed:
-            from core.chat_answer import uses_task
-            if uses_task(request,self.route_combo.currentData(),False):
-                from core.daily_workflows import workflow_for
-                from core.task_router import choose_task_route
-                from core.task_feedback import acknowledgement
-                workflow=self.runtime.workflows.match(request) or workflow_for(request)
-                route=choose_task_route(request,False,self.store.preference('execution_backend') or 'auto',workflow)
-                if route.get('executor')=='dsh' or any(word in request for word in ('上传','发布','投稿')):
-                    owner='DSH 深度执行器' if route.get('executor')=='dsh' else '咕嘎本地视觉智能体'
-                    label='这是一个复杂任务' if route.get('executor')=='dsh' else '这个任务包含上传或发布'
-                    question=acknowledgement(request).replace('我现在开始处理。','')+(label+'，由'+owner+'负责执行。确认无误请说“确认执行”；不执行请说“取消”。')
-                    self._pending_execution=dict(text=request,created=time.monotonic())
-                    self.status.setText('等待确认任务理解')
-                    self.store.append(self.active_id,'system',question)
-                    self._show_active_bubble(question)
-                    self.voice.resolve_task(call_id,dict(ok=True,answer=question,execution_pending=False))
-                    return
+        if not self._pending_image and not confirmed and self._offer_alignment(request,False,force_agent=True,use_attachment=True):
+            self.voice.resolve_task(call_id,dict(ok=True,answer='气泡里有两个方向，第三项可以补充要求。选好后我再开始。',execution_pending=False))
+            return
         self._voice_task = (self.voice, call_id)
         if not self._pending_image or uses_task(request,'auto',True):
             self.voice.set_task_context(dict(running=True,kind='local',goal=request,summary='已接收，正在启动后台执行'))
@@ -1707,7 +2609,6 @@ class AgentChatWindow(QDialog):
             value=str(question or '')
             if any(term in value for term in ('进度','进展','做到哪','怎么样了','在做什么','为什么','卡住','失败','下一步','汇报')):
                 state=self.runtime.dsh.status()
-                elapsed=state.get('started')
                 summary=state.get('summary') or 'DSH 尚未返回可核验的新进展'
                 return ('当前任务仍在执行。最新记录是：'+summary+
                     '。目前没有新的明确错误原因，我不会把等待说成完成。')
@@ -1795,11 +2696,19 @@ class AgentChatWindow(QDialog):
                 if command['action']=='screen_share_start':
                     if not self.voice_active:raise RuntimeError('请先开启长语音通话；共享屏幕只在长对话中作为辅助开启')
                     self._screen_share_manual_stop=False
-                    result=self.runtime.screen_share.start(command.get('fps'),'voice')
+                    native = self._native_video_call
+                    if native:
+                        if not self.voice or not self.voice.connected:
+                            raise RuntimeError('通话接通后可以共享屏幕')
+                        result = self.runtime.screen_share.start(2, 'voice', native_video=True)
+                    else:
+                        result = self.runtime.screen_share.start(command.get('fps'), 'voice')
+                    self._set_call_share_control(True)
                     result['message']='屏幕共享已作为长对话辅助开启，本地按'+str(result['fps'])+'帧/秒采集；画面只保留在内存'
                 else:
                     self._screen_share_manual_stop=True
                     self.runtime.screen_share.stop()
+                    self._set_call_share_control(False)
                     result=dict(ok=True,message='已停止共享屏幕')
             except Exception as exc:result=dict(ok=False,error='共享屏幕未开始：'+str(exc))
             return self._finish_fast_command(command,result)
@@ -1881,10 +2790,26 @@ class AgentChatWindow(QDialog):
             # freeze the Qt thread that receives voice events and user input.
             import threading
             from core.fast_commands import execute
+            blocker=self._launch_blocker()
+            if blocker:
+                # 不空口拒绝：把这句话记下来，占用结束自动补开，用户不用再说一遍。
+                if not command.get('_replay'):
+                    self._pending_launch=dict(command=dict(command),at=time.time(),
+                                              conversation_id=self.active_id)
+                hint='「%s」' % str(command.get('source_text') or command.get('target') or '')[:20] if (
+                    command.get('source_text') or command.get('target')) else '这一步'
+                return self._finish_fast_command(command,dict(ok=False,code='desktop_busy',
+                    queued_retry=not command.get('_replay'),
+                    error=blocker+(hint+'已经记下，做完手上这步我立刻打开' if not command.get('_replay')
+                                   else hint+'这次没排上，等桌面空出来再喊我')))
             self._fast_launch_count=getattr(self,'_fast_launch_count',0)+1
+            self._fast_launch_at=time.time()
             command=dict(command,_async_launch=True,_conversation_id=self.active_id)
             self._last_fast_result=dict(ok=True,execution_pending=True,message='正在提交启动请求')
-            def work():self.fast_result.emit(command,execute(command))
+            def work():
+                try:result=execute(command,self.agent.computer)
+                except Exception as exc:result=dict(ok=False,error=str(exc),action_sent=None)
+                self.fast_result.emit(command,result)
             threading.Thread(target=work,name='guga-fast-launch',daemon=True).start()
             return self._last_fast_result
         from core.fast_commands import execute
@@ -1906,6 +2831,37 @@ class AgentChatWindow(QDialog):
         else:result=execute(command)
         return self._finish_fast_command(command,result)
 
+    def _launch_blocker(self):
+        """「打开/启动」要不要等一等。空字符串=可以立刻开。
+
+        只挡真的在操作桌面的情况：一次启动还没回执、任务/DSH 正在点桌面。
+        普通问答（_run_kind=='answer'）不占桌面，不该拦「打开b站」——之前它
+        就是这么被拦掉的，然后既不重试也不转交，用户看到的就是"打不开了"。
+        计数泄漏（线程没回执）用 20 秒租约兜底，别让一次丢回执锁死之后所有启动。
+        """
+        if getattr(self,'_fast_inflight',False):
+            return '上一步桌面操作还在核验。'
+        count=int(getattr(self,'_fast_launch_count',0) or 0)
+        if count:
+            age=time.time()-float(getattr(self,'_fast_launch_at',0) or 0)
+            if age<20:
+                return '上一次启动还没回执。'
+            self._fast_launch_count=0
+        if self.busy and self._run_kind in ('task','dsh'):
+            return '正在执行桌面任务。'
+        return ''
+
+    def _replay_pending_launch(self):
+        """上一轮被挡下的「打开X」，桌面空出来后自动补开一次。"""
+        pending=getattr(self,'_pending_launch',None)
+        if not pending:return
+        self._pending_launch=None
+        if time.time()-float(pending.get('at',0) or 0)>120:return
+        command=pending.get('command') or {}
+        if not command or self.busy or getattr(self,'_fast_inflight',False):return
+        try:self._fast_command(dict(command,_replay=True))
+        except Exception:pass
+
     def _finish_fast_command(self,command,result):
         if command.get('_reflex') and result.get('need_model'):
             return self._reflex_fallback(command,result)
@@ -1919,7 +2875,8 @@ class AgentChatWindow(QDialog):
             result.update(execution_pending=True,message='已请求默认浏览器搜索，正在核对网页摘要后汇报')
             QTimer.singleShot(0,lambda:self.send('请用web_search搜索：'+query+'。根据工具返回的摘要简短汇报，并附来源链接。浏览器已提交打开请求，无需再次打开。',record_user=False))
         if (not result.get('ok') and command.get('action') in ('open_app','open_url','web_search')
-                and result.get('code')!='app_not_found' and command.get('source_text')
+                and result.get('code')!='app_not_found' and not result.get('queued_retry')
+                and command.get('source_text')
                 and not result.get('launch_requested') and current):
             # Retrying the same sentence through the remote brain used to be the
             # default. When that gateway is down it hangs, writes the failure into
@@ -1948,7 +2905,8 @@ class AgentChatWindow(QDialog):
             self.status.setText(result.get('message','快速命令已完成'))
             if command.get('_read_reply'):
                 self._say_active_reply(result.get('message','快速命令已完成'),speak=True)
-            if command.get('action') in ('browser_step','desktop_step') or command.get('_reflex'):self._show_active_bubble(result.get('message','已执行这一步'))
+            if command.get('action') in ('browser_step','desktop_step','open_app','open_url','web_search') or command.get('_reflex'):
+                self._show_active_bubble(result.get('message','已执行这一步'))
             if command.get('_conversation_id'):
                 self.store.append(command['_conversation_id'],'assistant',result.get('message','快速命令已完成'))
                 self.render()
@@ -2027,9 +2985,17 @@ class AgentChatWindow(QDialog):
             self._voice_departing=False;self._voice_farewell_started=0.0
             self._release_failed_voice()
             if not self.voice.last_error:
-                self.status.setText('通话已结束 · 阿里语音连接已关闭')
+                self.status.setText('通话已结束')
 
     def shutdown(self):
+        if hasattr(self.runtime, 'file_assistant'):
+            self.runtime.file_assistant.stop(persist=False)
+        if hasattr(self,'managed'):self.managed.close()
+        self._codex_closing=True
+        monitor=getattr(self,'_dsh_monitor',None)
+        if monitor is not None:monitor.close()
+        codex=getattr(self.runtime,'codex',None)
+        if codex is not None:codex.close()  # Only detach monitoring; do not cancel desktop tasks.
         try:
             from core.reflex import stop_foreground_tracker
             stop_foreground_tracker()

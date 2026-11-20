@@ -6,8 +6,6 @@ is recruit. Memory state is read-only (HearthMirror); no memory write backend is
 claimed here.
 """
 import time
-from pathlib import Path
-import json
 
 
 def _gold(state):
@@ -28,8 +26,12 @@ def fast_choice(state,actions,metadata=None):
     """Return a bounded local plan for obvious states; None means defer."""
     metadata=metadata or {}
     if not actions:return None
-    gold=_gold(state);board=[e for e in (state.get('entities') or {}).values() if e.get('CONTROLLER')==state.get('controller') and e.get('ZONE')=='PLAY' and e.get('CARDTYPE')=='MINION']
-    hand=[e for e in (state.get('entities') or {}).values() if e.get('CONTROLLER')==state.get('controller') and e.get('ZONE')=='HAND']
+    gold=_gold(state)
+    # 已知缺口（重构时未改行为，仅留痕）：这里原本会算一份 board/hand 快照，但算完从未被使用。
+    # 下面 SELL 分支的注释写着「只有满场且需要腾位置时才考虑卖出」，代码却从不检查满场。
+    # 更关键的是：SELL 的 score = -100 + (-strength/20)，恒 ≤ -100，而函数末尾
+    # `if best[0]<=0 ... return None` 会把非正分全部丢弃——也就是说卖出策略整条不可达。
+    # 要修就两件事：用 board/hand 真正判断「满场且需要腾位」，并给 SELL 一个能过门槛的正分。
     turn=float(state.get('round') or 0);tier=float(state.get('tier') or 1);scored=[]
     for action in actions:
         kind=action.get('kind');card=_entity(state,action);score=-999.;reason=''

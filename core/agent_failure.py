@@ -55,6 +55,21 @@ def exception_evidence(exc, base_url='', *, stage='model_request', elapsed_ms=0,
 def explain_failure(error, *, diagnostic=None, operations=0, events=(), blockers=(),last_tool_failure=None):
     diagnostic=diagnostic or {}
     last_tool_failure=last_tool_failure or {}
+    # 执行器给了结构化失败码时走统一四段式（失败码/阶段/原始异常/下一步）。
+    # 否则气泡里只剩一句自由文本，用户和日志都拿不到可核对的码——20261114 注入签名
+    # 不匹配（expected LP_INPUT instance instead of INPUT_Array_122）就是这样被吞成
+    # “未归类异常”的。没有 code 时保持原有叙述式解释。
+    code=str(last_tool_failure.get('code') or '').strip()
+    if code:
+        from core.failure_report import format_failure,next_action_for
+        app=last_tool_failure.get('app') or ''
+        raw=last_tool_failure.get('raw') or last_tool_failure.get('error') or str(error or '')
+        action=last_tool_failure.get('next_action') or next_action_for(code,app)
+        report=format_failure(code,last_tool_failure.get('stage') or '',raw,action,app=app)
+        if operations:
+            successes=sum(e.get('ok') is True for e in events)
+            report+='\n【执行情况】已调用工具%d次，其中%d次返回成功；这些回执不等于整个目标完成。'%(operations,successes)
+        return report
     reason=diagnostic.get('reason') or last_tool_failure.get('error') or str(error or '执行器没有提供明确原因')
     # Non-transport errors are already redacted by the task executor.
     reason=re.sub(r'\s+',' ',reason).strip()[:240]
@@ -71,3 +86,9 @@ def explain_failure(error, *, diagnostic=None, operations=0, events=(), blockers
         ('target_ambiguous','target_not_foreground','target_missing','tab_unavailable') else
         '先重新观察目标并核对最后一步，再处理尚未完成的部分')
     return f'这次未完成。{reason.rstrip("。")}。{impact}下一步：{next_step}。'
+
+
+# ---- [teammate-merge] legacy compat re-exports (additive) ----
+from core.legacy_compat import (  # noqa: E402,F401
+    proxy_snapshot,
+)

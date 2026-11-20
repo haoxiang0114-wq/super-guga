@@ -18,7 +18,7 @@ class DshTools:
             raise RuntimeError('任务已取消，不再执行后续工具')
         agent=self.panel.agent; ticket=mgr.state.get('ticket_id')
         if name=='personal_memory':
-            memory=self.panel.memory; owner=mgr.state['agent_id']; action=args.get('action')
+            owner=mgr.state['agent_id']; action=args.get('action')
             if action=='propose_lesson':return dict(ok=True,**mgr.archive.propose(owner,ticket,args.get('content','')))
             if action=='lessons':return dict(ok=True,lessons=mgr.archive.lessons(owner))
             return self.panel.runtime.companion_memory.execute(owner,mgr.state.get('conversation_id'),args)

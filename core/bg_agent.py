@@ -42,6 +42,14 @@ def validate_snapshot(raw):
     if len(json.dumps(raw, ensure_ascii=False, allow_nan=False)) > 100000:
         raise SnapshotError("局面超过 100 KB")
     s = deepcopy(raw)
+    _validate_snapshot_header(s)
+    _validate_snapshot_scalars(s)
+    _validate_snapshot_zones(s)
+    return s
+
+
+def _validate_snapshot_header(s):
+    """Schema version, identifying strings, phase and revision."""
     if type(s.get("schema_version")) is not int or s["schema_version"] != 1:
         raise SnapshotError("schema_version 必须为 1")
     for key in ("game_id", "patch", "phase", "source"):
@@ -50,6 +58,10 @@ def validate_snapshot(raw):
     if s["phase"] not in {"recruit", "choice", "combat", "unknown", "ended"}:
         raise SnapshotError("phase 无效")
     _integer(s.get("revision"), "revision")
+
+
+def _validate_snapshot_scalars(s):
+    """Numeric resources, tier, boolean flags and the live timestamp."""
     for key in ("gold", "health", "armor", "upgrade_cost", "refresh_cost", "turn"):
         s.setdefault(key, None)
         _integer(s[key], key, optional=True)
@@ -63,6 +75,10 @@ def validate_snapshot(raw):
         seen = s.get("observed_at")
         if type(seen) not in (int, float) or not math.isfinite(seen):
             raise SnapshotError("实时局面需要 observed_at 时间戳")
+
+
+def _validate_snapshot_zones(s):
+    """The four entity zones and their global entity_id uniqueness."""
     ids = set()
     for zone, cap in (("board", 7), ("hand", 10), ("shop", 20), ("choices", 20)):
         s.setdefault(zone, [])
@@ -71,37 +87,41 @@ def validate_snapshot(raw):
         for c in s[zone]:
             if not isinstance(c, dict):
                 raise SnapshotError(f"{zone} 实体必须是对象")
-            uid = c.get("entity_id")
-            if not isinstance(uid, str) or not 1 <= len(uid) <= 100 or uid in ids:
-                raise SnapshotError("entity_id 必须非空且在整个局面内唯一")
-            ids.add(uid)
-            c.setdefault("name", uid)
-            if not isinstance(c["name"], str) or len(c["name"]) > 200:
-                raise SnapshotError("实体名称无效")
-            for key, limit in (("card_id", 100), ("text", 2000)):
-                c.setdefault(key, "")
-                if not isinstance(c[key], str) or len(c[key]) > limit:
-                    raise SnapshotError(f"{uid}.{key} 无效")
-            c.setdefault("kind", "minion")
-            c.setdefault("effect", "unknown")
-            c.setdefault("currency", "unknown")
-            if (any(not isinstance(c[k], str) for k in ("kind", "effect", "currency"))
-                    or c["kind"] not in {"minion", "spell", "unknown"}
-                    or c["effect"] not in {"vanilla", "unknown", "targeted", "special"}
-                    or c["currency"] not in {"gold", "health", "unknown"}):
-                raise SnapshotError(f"{uid} 的 kind/effect/currency 无效")
-            c.setdefault("golden", False)
-            if type(c["golden"]) is not bool:
-                raise SnapshotError("golden 必须是布尔值")
-            for key in ("attack", "health", "buy_cost", "sell_value", "choice_cost"):
-                c.setdefault(key, None)
-                _integer(c[key], f"{uid}.{key}", optional=True)
-            for key in ("races", "keywords"):
-                c.setdefault(key, [])
-                if (not isinstance(c[key], list) or len(c[key]) > 30
-                        or any(not isinstance(x, str) or len(x) > 80 for x in c[key])):
-                    raise SnapshotError(f"{uid}.{key} 无效")
-    return s
+            _validate_snapshot_entity(c, ids)
+
+
+def _validate_snapshot_entity(c, ids):
+    """One entity: identity, display fields, kind taxonomy and per-card numbers."""
+    uid = c.get("entity_id")
+    if not isinstance(uid, str) or not 1 <= len(uid) <= 100 or uid in ids:
+        raise SnapshotError("entity_id 必须非空且在整个局面内唯一")
+    ids.add(uid)
+    c.setdefault("name", uid)
+    if not isinstance(c["name"], str) or len(c["name"]) > 200:
+        raise SnapshotError("实体名称无效")
+    for key, limit in (("card_id", 100), ("text", 2000)):
+        c.setdefault(key, "")
+        if not isinstance(c[key], str) or len(c[key]) > limit:
+            raise SnapshotError(f"{uid}.{key} 无效")
+    c.setdefault("kind", "minion")
+    c.setdefault("effect", "unknown")
+    c.setdefault("currency", "unknown")
+    if (any(not isinstance(c[k], str) for k in ("kind", "effect", "currency"))
+            or c["kind"] not in {"minion", "spell", "unknown"}
+            or c["effect"] not in {"vanilla", "unknown", "targeted", "special"}
+            or c["currency"] not in {"gold", "health", "unknown"}):
+        raise SnapshotError(f"{uid} 的 kind/effect/currency 无效")
+    c.setdefault("golden", False)
+    if type(c["golden"]) is not bool:
+        raise SnapshotError("golden 必须是布尔值")
+    for key in ("attack", "health", "buy_cost", "sell_value", "choice_cost"):
+        c.setdefault(key, None)
+        _integer(c[key], f"{uid}.{key}", optional=True)
+    for key in ("races", "keywords"):
+        c.setdefault(key, [])
+        if (not isinstance(c[key], list) or len(c[key]) > 30
+                or any(not isinstance(x, str) or len(x) > 80 for x in c[key])):
+            raise SnapshotError(f"{uid}.{key} 无效")
 
 
 def state_id(s):

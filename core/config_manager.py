@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """配置管理 — QSettings 封装"""
-from PyQt5.QtCore import QSettings, QPoint, QByteArray
+from PyQt5.QtCore import QSettings
 
 
 class ConfigManager:
@@ -33,8 +33,13 @@ class ConfigManager:
         self._s.setValue("pos/y", y)
 
     def load_pos(self, fallback: tuple = (200, 200)) -> tuple:
-        x = self._s.value("pos/x", fallback[0], type=int)
-        y = self._s.value("pos/y", fallback[1], type=int)
+        if not self._s.contains("pos/x") or not self._s.contains("pos/y"):
+            return fallback
+        try:
+            x = self._s.value("pos/x", type=int)
+            y = self._s.value("pos/y", type=int)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
         return (x, y)
 
     # ---- 面板开关 ----

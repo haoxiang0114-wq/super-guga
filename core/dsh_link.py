@@ -381,11 +381,8 @@ class DshLink(QObject):
             row.pop('stale_notified',None)
             text=self._report_text(row,now)
             if not text:return
-            try:
-                from core.super_agent.narration import compose
-                text=compose(text,with_memory=True)
-            except Exception:
-                pass
+            # The model digest is the complete public report. Do not append
+            # unrelated screen observations or memories to task progress.
             if text==self.last_spoken_text:return
         voice=getattr(panel,'voice',None)
         if getattr(panel,'voice_active',False) and voice:

@@ -30,3 +30,22 @@ def spoken_reply(text):
         return ''
     text=re.sub(pattern,remove,text)
     return expression,action,text.strip()
+
+
+# Plain replies and audio transcripts may have no expression metadata.
+# Restrict inference to conversational cues, never actions mentioned as topics.
+_REACTIONS = (
+    (re.compile(r'^(?:别担心|辛苦了|听起来(?:很|挺)?(?:难过|不容易)|抱抱)'), 'sad', 'nod'),
+    (re.compile(r'^(?:哇[！!，,]|诶[？?，,]|咦[？?，,]|居然|竟然)'), 'surprised', 'tilt'),
+    (re.compile(r'^(?:哈哈[哈]*|嘿嘿|太好了|好耶|恭喜)'), 'happy', 'nod'),
+    (re.compile(r'^(?:你好[！!，,～~ ]|(?:早上|晚上|下午)好[！!，,～~ ]|嗨[！!，,～~ ])'), 'happy', 'wave'),
+    (re.compile(r'^(?:好(?:的|呀)?[！!，,。～~]|明白了|收到[！!，,。～~])'), 'normal', 'nod'),
+)
+
+
+def reply_performance(text, expression=None, action='none'):
+    clean = re.sub(r'^(?:咕嘎[～~！!，, ]+|[*#　 ]+)', '', str(text).strip()).strip()
+    for cue, face, gesture in _REACTIONS:
+        if cue.search(clean):
+            return expression or face, action if action != 'none' else gesture
+    return expression, action

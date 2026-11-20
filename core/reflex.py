@@ -740,7 +740,7 @@ def _resolve_editable(backend, window, info):
 def _interactive_items(backend, info):
     try:
         snapshot = backend.snapshot(int(info['hwnd']), limit=240)
-    except Exception as exc:
+    except Exception:
         raise _NeedModel('这个窗口我现在读不到控件，这次没有操作') from None
     items = []
     seen = set()

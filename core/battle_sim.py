@@ -18,7 +18,7 @@ v2.1 增强（轨道③实时胜率解读）：simulate_one 增加可选 stats �
 format_matchup_insight（一句话人话）。旧 API（win_rate/format_rate 等）不变。
 """
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 from core import card_db

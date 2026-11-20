@@ -334,6 +334,10 @@ def normalize_expect(raw, step=None):
     return expect
 
 
+_SELECTOR_EXPECT_KINDS = ('exists', 'absent', 'name_equals', 'name_contains', 'value_equals',
+                          'value_contains', 'enabled', 'disabled', 'focused')
+
+
 def normalize_step(raw, index):
     if not isinstance(raw, dict):
         raise WorkflowError('第 %d 步不是对象' % index)
@@ -347,12 +351,29 @@ def normalize_step(raw, index):
         raise WorkflowError('第 %d 步未知动作 %r；支持 %s' % (index, op, '/'.join(OPS)))
     step = {'id': index, 'op': op, 'title': _text(raw.get('title'), 120) or (op + ' 第%d步' % index)}
     expect = normalize_expect(raw.get('expect'), step)
-    needs_selector = op in ('act', 'click', 'type', 'scroll') or (
-        op in ('wait', 'verify') and expect['kind'] in
-        ('exists', 'absent', 'name_equals', 'name_contains', 'value_equals',
-         'value_contains', 'enabled', 'disabled', 'focused') and
-        expect.get('selector') is None)
-    step['selector'] = normalize_selector(raw.get('selector'), required=needs_selector)
+    step['selector'] = normalize_selector(raw.get('selector'),
+                                          required=_step_needs_selector(op, expect))
+    step.update(_step_payload_fields(raw, index, op))
+    if raw.get('window') is not None:
+        step['window'] = normalize_app_hint(raw['window'])
+    step['timeout_ms'] = _int_in(raw.get('timeout_ms'), 100, 30000, default=5000,
+                                 label='第 %d 步 timeout_ms' % index)
+    step['expect'] = expect
+    _require_step_expect_selector(step, index)
+    _reject_dangerous(step)
+    return step
+
+
+def _step_needs_selector(op, expect):
+    """Whether the action itself (or a selector-based verification) needs a target."""
+    return op in ('act', 'click', 'type', 'scroll') or (
+        op in ('wait', 'verify') and expect['kind'] in _SELECTOR_EXPECT_KINDS
+        and expect.get('selector') is None)
+
+
+def _step_payload_fields(raw, index, op):
+    """Per-op fields: UIA operation, text/times/keys/state, and open_app launch."""
+    fields = {}
     operation = _text(raw.get('operation'), 40)
     if op in ('act', 'click'):
         allowed_ops = ('invoke', 'set_value', 'focus', 'click', 'toggle', 'expand',
@@ -360,43 +381,38 @@ def normalize_step(raw, index):
         if operation and operation not in allowed_ops:
             raise WorkflowError('第 %d 步不支持 UIA 操作 %r' % (index, operation))
         if operation:
-            step['operation'] = operation
+            fields['operation'] = operation
     if op == 'type':
         value = raw.get('value')
         if not isinstance(value, str) or not value:
             raise WorkflowError('第 %d 步 type 需要 1—4000 字的 value' % index)
         if len(value) > 4000:
             raise WorkflowError('第 %d 步 type 的 value 超过 4000 字' % index)
-        step['value'] = value
+        fields['value'] = value
     elif op == 'scroll':
-        step['times'] = _int_in(raw.get('times', raw.get('value', 1)), 1, 20, default=1,
-                                label='第 %d 步 scroll.times' % index)
+        fields['times'] = _int_in(raw.get('times', raw.get('value', 1)), 1, 20, default=1,
+                                  label='第 %d 步 scroll.times' % index)
     elif op == 'key':
         keys = _text(raw.get('keys') or raw.get('value'), 80)
         if not keys:
             raise WorkflowError('第 %d 步 key 需要 keys' % index)
-        step['keys'] = keys
+        fields['keys'] = keys
     elif op in ('act',) and isinstance(raw.get('value'), str):
-        step['value'] = _text(raw.get('value'), 4000)
+        fields['value'] = _text(raw.get('value'), 4000)
     elif op == 'wait':
         state = _text(raw.get('state'), 20) or 'exists'
         if state not in ('exists', 'absent'):
             raise WorkflowError('第 %d 步 wait.state 只支持 exists/absent' % index)
-        step['state'] = state
+        fields['state'] = state
     if op == 'open_app' and raw.get('launch'):
-        step['launch'] = True
-    if raw.get('window') is not None:
-        step['window'] = normalize_app_hint(raw['window'])
-    step['timeout_ms'] = _int_in(raw.get('timeout_ms'), 100, 30000, default=5000,
-                                 label='第 %d 步 timeout_ms' % index)
-    step['expect'] = expect
-    if step['expect']['kind'] in ('exists', 'absent', 'name_equals', 'name_contains',
-                                  'value_equals', 'value_contains', 'enabled', 'disabled',
-                                  'focused') \
+        fields['launch'] = True
+    return fields
+
+
+def _require_step_expect_selector(step, index):
+    if step['expect']['kind'] in _SELECTOR_EXPECT_KINDS \
             and step['expect'].get('selector') is None and step.get('selector') is None:
         raise WorkflowError('第 %d 步的核验需要目标 selector（步骤或 expect 里给一个）' % index)
-    _reject_dangerous(step)
-    return step
 
 
 def normalize_workflow(raw, *, allow_empty=False):
@@ -840,48 +856,55 @@ class WorkflowRunner:
         expect = step['expect']
         kind = expect['kind']
         timeout_s = (expect.get('timeout_ms') or step.get('timeout_ms') or 5000) / 1000.0
-        selector = expect.get('selector') or step.get('selector')
         self.last_verify_error = ''
         if kind == 'foreground':
-            hwnd = self.window(step)
-            if self._poll(lambda: self.desktop.foreground() == hwnd, timeout_s):
-                return True
-            self.last_verify_error = '前台窗口不是目标窗口'
-            return False
+            return self._expect_foreground(step, timeout_s)
         if kind == 'window_title_contains':
-            hwnd = self.window(step)
-            need = expect.get('value') or ''
-            if self._poll(lambda: need in self.desktop.window_title(hwnd), timeout_s):
-                return True
-            self.last_verify_error = '窗口标题里没有 %r（当前 %r）' % (
-                need, self.desktop.window_title(hwnd))
-            return False
+            return self._expect_window_title(step, expect, timeout_s)
+        selector = expect.get('selector') or step.get('selector')
         if selector is None:
             self.last_verify_error = '核验没有目标 selector'
             return False
         hwnd = self.window(step)
-
-        def element():
-            return self.desktop.locate(hwnd, selector)
-
         if kind == 'exists':
-            if self._poll(lambda: dict(element(), _ok=True), timeout_s):
+            if self._poll(lambda: dict(self.desktop.locate(hwnd, selector), _ok=True), timeout_s):
                 return True
             return False
         if kind == 'absent':
-            def gone():
-                try:
-                    element()
-                except SelectorNotFound:
-                    return True
-                return False
-            if self._poll(gone, timeout_s):
-                return True
-            self.last_verify_error = self.last_verify_error or '目标仍然存在'
-            return False
+            return self._expect_absent(hwnd, selector, timeout_s)
+        return self._expect_compare(hwnd, selector, kind, expect, timeout_s)
 
+    def _expect_foreground(self, step, timeout_s):
+        hwnd = self.window(step)
+        if self._poll(lambda: self.desktop.foreground() == hwnd, timeout_s):
+            return True
+        self.last_verify_error = '前台窗口不是目标窗口'
+        return False
+
+    def _expect_window_title(self, step, expect, timeout_s):
+        hwnd = self.window(step)
+        need = expect.get('value') or ''
+        if self._poll(lambda: need in self.desktop.window_title(hwnd), timeout_s):
+            return True
+        self.last_verify_error = '窗口标题里没有 %r（当前 %r）' % (
+            need, self.desktop.window_title(hwnd))
+        return False
+
+    def _expect_absent(self, hwnd, selector, timeout_s):
+        def gone():
+            try:
+                self.desktop.locate(hwnd, selector)
+            except SelectorNotFound:
+                return True
+            return False
+        if self._poll(gone, timeout_s):
+            return True
+        self.last_verify_error = self.last_verify_error or '目标仍然存在'
+        return False
+
+    def _expect_compare(self, hwnd, selector, kind, expect, timeout_s):
         def compare():
-            found = element()
+            found = self.desktop.locate(hwnd, selector)
             if kind == 'name_equals':
                 return str(found.get('name') or '') == expect.get('value')
             if kind == 'name_contains':
@@ -899,11 +922,10 @@ class WorkflowRunner:
             if kind == 'focused':
                 return bool(found.get('focused'))
             return False
-
         if self._poll(compare, timeout_s):
             return True
         try:
-            found = element()
+            found = self.desktop.locate(hwnd, selector)
             actual = found.get('value') if 'value' in kind else found.get('name')
         except SelectorError as exc:
             self.last_verify_error = str(exc)
@@ -1562,49 +1584,13 @@ def _sanitize_model_output(data):
     """
     notes = []
     data = dict(data)
-    for key in list(data):
-        if key not in _MODEL_TOP_FIELDS:
-            notes.append('顶层字段 %s' % key)
-            data.pop(key)
+    _drop_unknown_model_fields(data, notes)
     if isinstance(data.get('trigger_phrases'), str):
         data['trigger_phrases'] = [data['trigger_phrases']]
     if isinstance(data.get('app_hint'), dict):
-        hint = {}
-        for key, value in data['app_hint'].items():
-            mapped = _MODEL_APP_ALIASES.get(str(key).casefold(), key)
-            if mapped in ('query', 'process', 'window_class', 'title_contains') \
-                    and isinstance(value, str) and value.strip():
-                hint[mapped] = value.strip()
-            else:
-                notes.append('app_hint.%s' % key)
-        data['app_hint'] = hint or None
-    steps = []
-    for index, raw in enumerate(data.get('steps') or [], 1):
-        if not isinstance(raw, dict):
-            raise WorkflowError('模型返回的第 %d 步不是对象，未生成工作流' % index)
-        step = dict(raw)
-        if isinstance(step.get('selector'), dict):
-            step['selector'] = _sanitize_model_selector(step['selector'], notes, index)
-        if isinstance(step.get('expect'), dict):
-            expect = dict(step['expect'])
-            if isinstance(expect.get('selector'), dict):
-                expect['selector'] = _sanitize_model_selector(expect['selector'], notes, index)
-            step['expect'] = expect
-        for alias in ('seconds', 'wait_seconds', 'wait_ms'):
-            if alias in step:
-                try:
-                    millis = int(float(step.pop(alias)) * (1000 if alias != 'wait_ms' else 1))
-                    step.setdefault('timeout_ms', max(100, min(millis, 30000)))
-                except (TypeError, ValueError):
-                    step.pop(alias)
-        if 'key' in step and 'keys' not in step:
-            step['keys'] = step.pop('key')
-        for key in list(step):
-            if key not in _MODEL_STEP_FIELDS:
-                notes.append('第%d步字段 %s' % (index, key))
-                step.pop(key)
-        steps.append(step)
-    data['steps'] = steps
+        data['app_hint'] = _sanitize_model_app_hint(data['app_hint'], notes)
+    data['steps'] = [_sanitize_model_step(raw, index, notes)
+                     for index, raw in enumerate(data.get('steps') or [], 1)]
     if data.get('verify_recipe') is not None:
         try:
             normalize_recipe(data['verify_recipe'])
@@ -1612,6 +1598,56 @@ def _sanitize_model_output(data):
             notes.append('verify_recipe')
             data.pop('verify_recipe')
     return data, notes
+
+
+def _drop_unknown_model_fields(data, notes):
+    for key in list(data):
+        if key not in _MODEL_TOP_FIELDS:
+            notes.append('顶层字段 %s' % key)
+            data.pop(key)
+
+
+def _sanitize_model_app_hint(app_hint, notes):
+    hint = {}
+    for key, value in app_hint.items():
+        mapped = _MODEL_APP_ALIASES.get(str(key).casefold(), key)
+        if mapped in ('query', 'process', 'window_class', 'title_contains') \
+                and isinstance(value, str) and value.strip():
+            hint[mapped] = value.strip()
+        else:
+            notes.append('app_hint.%s' % key)
+    return hint or None
+
+
+def _sanitize_model_step(raw, index, notes):
+    if not isinstance(raw, dict):
+        raise WorkflowError('模型返回的第 %d 步不是对象，未生成工作流' % index)
+    step = dict(raw)
+    if isinstance(step.get('selector'), dict):
+        step['selector'] = _sanitize_model_selector(step['selector'], notes, index)
+    if isinstance(step.get('expect'), dict):
+        expect = dict(step['expect'])
+        if isinstance(expect.get('selector'), dict):
+            expect['selector'] = _sanitize_model_selector(expect['selector'], notes, index)
+        step['expect'] = expect
+    _normalize_model_step_timeouts(step)
+    if 'key' in step and 'keys' not in step:
+        step['keys'] = step.pop('key')
+    for key in list(step):
+        if key not in _MODEL_STEP_FIELDS:
+            notes.append('第%d步字段 %s' % (index, key))
+            step.pop(key)
+    return step
+
+
+def _normalize_model_step_timeouts(step):
+    for alias in ('seconds', 'wait_seconds', 'wait_ms'):
+        if alias in step:
+            try:
+                millis = int(float(step.pop(alias)) * (1000 if alias != 'wait_ms' else 1))
+                step.setdefault('timeout_ms', max(100, min(millis, 30000)))
+            except (TypeError, ValueError):
+                step.pop(alias)
 
 
 def compile_from_text(text, *, name=None, trigger_phrases=None, app_hint=None, slug=None,

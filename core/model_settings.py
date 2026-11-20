@@ -45,6 +45,25 @@ def load_config(path=CONFIG):
     return resolve_config(read_raw(path))
 
 
+def vision_config(cfg):
+    """Use the configured visual endpoint, including the older Zhipu setup."""
+    from core.model_endpoint import base_of
+    target = dict(cfg)
+    base = str(cfg.get('vision_base_url') or '').strip()
+    model = str(cfg.get('vision_model') or '').strip()
+    key = str(cfg.get('vision_api_key') or '').strip()
+    legacy_key = str(cfg.get('zhipu_api_key') or '').strip()
+    zhipu = 'https://open.bigmodel.cn/api/paas/v4'
+    if (not key and legacy_key and (not model or model.startswith('glm-'))
+            and (not base or base_of(base) == zhipu)):
+        return dict(target, base_url=zhipu,
+                    model=model or 'glm-4.6v-flash', api_key=legacy_key)
+    main_base = cfg.get('base_url') or ''
+    inherit = not base or (base_of(base) and base_of(base) == base_of(main_base))
+    return dict(target, base_url=base or main_base, model=model or cfg.get('model', ''),
+                api_key=key or (cfg.get('api_key', '') if inherit else ''))
+
+
 def public_settings():
     try:
         cfg=load_config();endpoint=urlsplit(cfg.get('base_url',''))

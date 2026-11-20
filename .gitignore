@@ -83,3 +83,7 @@ runtime/personal-harness-probe/
 runtime/research/
 runtime/video-workflows/
 runtime/video-workflow-qa/
+
+# Local plugin market state when GUGA_HOME points to the checkout
+/plugins/installed/
+/plugins/catalog-v1.json

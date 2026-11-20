@@ -69,6 +69,36 @@ def _prepare_qt():
         if os.path.isdir(mediaservice):
             os.environ['QT_MEDIA_BACKEND'] = 'windows'
     
+    # The separately installed official Qt tree has no WebEngine resources.
+    # Use the matching wheel's helper, pak files and locales together.
+    if not getattr(sys,'frozen',False):
+        import PyQt5
+        engine_root=os.path.join(os.path.dirname(PyQt5.__file__),'Qt5')
+        for key,relative in (('QTWEBENGINEPROCESS_PATH','bin/QtWebEngineProcess.exe'),
+                             ('QTWEBENGINE_RESOURCES_PATH','resources'),
+                             ('QTWEBENGINE_LOCALES_PATH','translations/qtwebengine_locales')):
+            candidate=os.path.join(engine_root,*relative.split('/'))
+            if os.path.exists(candidate):
+                # Qt 5's Chromium ICU loader cannot mmap some Unicode Windows
+                # profile paths. The OS alias points to these same installed files.
+                if os.name=='nt':
+                    short=ctypes.create_unicode_buffer(32768)
+                    if ctypes.windll.kernel32.GetShortPathNameW(candidate,short,len(short)):candidate=short.value
+                os.environ[key]=candidate
+    # Embedded artifact pages share the existing Qt application; this must be
+    # set before QApplication is created, including in test harnesses.
+    # PyQt5 embeds its qt.conf using the local Windows code page at first
+    # QtCore import. Normalize that one path before it is embedded, otherwise
+    # the Chinese user directory becomes literal '?' and ICU cannot load.
+    import PyQt5
+    original_module_file=PyQt5.__file__
+    if os.name=='nt' and not getattr(sys,'frozen',False) and 'PyQt5.QtCore' not in sys.modules:
+        short=ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(original_module_file,short,len(short)):PyQt5.__file__=short.value
+    try:
+        from PyQt5.QtCore import QCoreApplication,Qt
+    finally:PyQt5.__file__=original_module_file
+    if QCoreApplication.instance() is None:QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     return qt_plugins is not None
 
 
@@ -102,6 +132,9 @@ def main():
         _show_error('桌宠启动时发生错误：\n\n' + text[-2000:])
 
     sys.excepthook = excepthook
+
+    # Guga starts independently. ManagedChats starts DSH only for an explicit
+    # DSH task, so opening the pet cannot launch an unused executor.
 
     # 管理员模式：一键拔线需要管理员权限（ai_config.json 的 run_as_admin）
     # UAC 被拒绝时降级为普通模式继续运行（桌宠不消失，仅拔线不可用）

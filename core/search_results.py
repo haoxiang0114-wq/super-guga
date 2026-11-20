@@ -1,5 +1,5 @@
 """Small evidence-producing web search, run only in the agent worker."""
-import requests,re,html
+import requests,re
 from html.parser import HTMLParser
 class Results(HTMLParser):
     def __init__(self):super().__init__();self.results=[];self.item=None;self.depth=0;self.anchor=False

@@ -23,6 +23,7 @@ import json
 import base64
 import re
 import glob
+import subprocess
 from urllib.parse import urlsplit
 from PyQt5.QtCore import QObject, pyqtSignal, QUrl
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -56,6 +57,28 @@ def strip_punct(text: str) -> str:
     text = _PUNCT_RE.sub('', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+def _speech_envelope(path):
+    """Read the synthesized track in 40 ms blocks for locally timed lip movement."""
+    try:
+        import numpy as np
+        from core.media_workflow import ffmpeg_path
+        audio = subprocess.run(
+            [ffmpeg_path(), '-v', 'error', '-i', path, '-t', '180',
+             '-f', 's16le', '-ac', '1', '-ar', '8000', 'pipe:1'],
+            capture_output=True, check=True, timeout=5,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        ).stdout
+        pcm = np.frombuffer(audio, dtype='<i2').astype(np.float32) / 32768.
+        blocks = pcm[:len(pcm) // 320 * 320].reshape(-1, 320)
+        if not len(blocks):
+            return ()
+        rms = np.sqrt(np.mean(blocks ** 2, axis=1))
+        ceiling = max(.025, float(np.quantile(rms, .90)))
+        return tuple(float(n) for n in np.clip((rms - .008) / ceiling, 0., 1.))
+    except (ImportError, ValueError, OSError, subprocess.SubprocessError):
+        return ()
 
 
 class TTSEngine(QObject):
@@ -102,7 +125,7 @@ class TTSEngine(QObject):
     DOUBAO_RESOURCE = "seed-tts-2.0"
 
     # 主线程接收: (token, path) — 合成完毕, 主线程负责播放
-    _synth_ready = pyqtSignal(int, str)
+    _synth_ready = pyqtSignal(int, str, object)
     # 主线程接收: (token,) — 合成失败, 主线程负责收尾
     _synth_failed = pyqtSignal(int)
 
@@ -115,6 +138,7 @@ class TTSEngine(QObject):
         self._is_speaking = False
         self._silent = False    # 静默: 只关本地朗读播报
         self._session = None
+        self._envelope = ()
         self._speak_token = 0   # 每次 speak 自增, 用于失效旧请求
         self._current_token = 0  # 当前正在播放的 token
         self._display_text = ''
@@ -296,7 +320,7 @@ class TTSEngine(QObject):
             self.last_error = ''
             self._last_provider = used
             self._last_bytes = size
-            self._synth_ready.emit(token, tmp_path)
+            self._synth_ready.emit(token, tmp_path, _speech_envelope(tmp_path))
         except Exception as e:
             print(f"[TTS] synth_worker 错误: {e}", file=sys.stderr)
             self._safe_remove(tmp_path)
@@ -399,7 +423,7 @@ class TTSEngine(QObject):
             return False
 
     # ---- 主线程槽: 合成完成 ----
-    def _on_synth_ready(self, token: int, path: str):
+    def _on_synth_ready(self, token: int, path: str, envelope=()):
         # 若已经被新的 speak / stop 失效, 直接清理不播放
         if token != self._speak_token:
             self._safe_remove(path)
@@ -419,6 +443,7 @@ class TTSEngine(QObject):
             content = QMediaContent(url)
             self._current_token = token
             self._player.setMedia(content)
+            self._envelope = envelope
             self._player.play()
         except Exception as e:
             print(f"[TTS] 播放错误: {e}", file=sys.stderr)
@@ -489,6 +514,16 @@ class TTSEngine(QObject):
                     continue
         except Exception:
             pass
+
+    def mouth_level(self):
+        if self._player.state() != QMediaPlayer.PlayingState:
+            return 0.
+        position = max(0, self._player.position())
+        if self._envelope:
+            index = position // 40
+            return self._envelope[index] if index < len(self._envelope) else 0.
+        # A player without an available PCM decoder still has a playback clock.
+        return (.08, .48, .7, .25, .58, .36, .1)[(position // 75) % 7]
 
     @property
     def is_speaking(self):

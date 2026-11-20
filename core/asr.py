@@ -10,6 +10,8 @@
     recorder.stop()       # 停止并转写
     text = recorder.result
 """
+import json
+import logging
 import os
 import queue
 import threading
@@ -113,20 +115,25 @@ class ASRRecorder:
         self._peak = 0
         self.level = 0.
         self._start_time = 0.0
+        self.backend='vosk';self._pcm=[]
 
     @property
     def available(self) -> bool:
         """依赖与模型是否就绪"""
         if not self._check_imports():
             return False
+        from core.local_transcription import available
+        if available():self.backend='whisper-small';return True
         return self._ensure_model()
 
     def _check_imports(self):
         try:
             import sounddevice  # noqa
-            import vosk  # noqa
             self._sd = sounddevice
-            self._vosk = vosk
+            try:
+                import vosk
+                self._vosk = vosk
+            except ImportError:self._vosk=None
             return True
         except ImportError:
             return False
@@ -134,12 +141,13 @@ class ASRRecorder:
     def _ensure_model(self) -> bool:
         if self._model is not None:
             return True
-        import vosk
+        if self._vosk is None:
+            return False
         # 检查模型目录（解压后是 vosk-model-small-cn-0.22 子目录）
         if not os.path.isdir(MODEL_DIR):
             return False
         try:
-            self._model = vosk.Model(MODEL_DIR)
+            self._model = self._vosk.Model(MODEL_DIR)
             return True
         except Exception:
             return False
@@ -150,13 +158,16 @@ class ASRRecorder:
         if not self._check_imports():
             self.error = '缺少 sounddevice/vosk 依赖，请先安装'
             return
-        if not self._ensure_model():
+        from core.local_transcription import available
+        self.backend='whisper-small' if available() else 'vosk'
+        if self.backend=='vosk' and not self._ensure_model():
             self.error = f'未找到中文语音模型（{MODEL_DIR}），请先下载'
             return
         self.result = ''
         self.error = None
         self._recording = True
-        self._recognizer = self._vosk.KaldiRecognizer(self._model, 16000)
+        self._pcm=[];self._q=queue.Queue()
+        self._recognizer = self._vosk.KaldiRecognizer(self._model, 16000) if self.backend=='vosk' else None
         self.device = _pick_input_device()
         self._frame_count = 0
         self._peak = 0
@@ -168,15 +179,15 @@ class ASRRecorder:
 
     def _record_loop(self):
         import sounddevice as sd
-        import numpy as np
         try:
             with sd.RawInputStream(samplerate=16000, blocksize=4000, dtype='int16',
                                    channels=1, device=self.device, callback=self._callback):
-                while self._recording:
+                while self._recording or not self._q.empty():
                     # 持续消费队列，交给 recognizer
                     try:
                         data = self._q.get(timeout=0.3)
-                        if self._recognizer.AcceptWaveform(data):
+                        self._pcm.append(data)
+                        if self._recognizer is not None and self._recognizer.AcceptWaveform(data):
                             res = self._recognizer.Result()
                             import json as _json
                             try:
@@ -201,11 +212,6 @@ class ASRRecorder:
             self.level = min(1.,float(np.sqrt(np.mean(arr*arr)))/3500.) if arr.size else 0.
             if peak > self._peak:
                 self._peak = peak
-            if peak > 0:
-                gain = min(_MAX_GAIN, _GAIN_PEAK / peak)
-                arr = arr * gain
-                np.clip(arr, -32767, 32767, out=arr)
-                raw = arr.astype(np.int16).tobytes()
         except Exception:
             pass
         self._q.put(raw)
@@ -217,6 +223,23 @@ class ASRRecorder:
         self._recording = False
         if self._thread:
             self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                self.error='麦克风尚未释放，本轮没有提交识别结果';return ''
+        pcm, self._pcm = self._pcm, []
+        if self.error:
+            return ''
+        if self.backend == 'whisper-small':
+            try:
+                from core.local_transcription import transcribe
+                self.result = transcribe(b''.join(pcm))
+            except Exception as exc:
+                logging.getLogger(__name__).info('Whisper unavailable, using Vosk: %s', type(exc).__name__)
+                try:
+                    self.result = self._transcribe_backup(pcm)
+                    self.backend = 'vosk'
+                except Exception:
+                    self.error = '离线语音识别暂不可用，请检查本地中文识别模型'
+            return self.result.strip()
         # 取残留
         if self._recognizer is not None:
             try:
@@ -231,6 +254,17 @@ class ASRRecorder:
             except Exception:
                 pass
         return self.result.strip()
+
+    def _transcribe_backup(self, pcm):
+        if not self._ensure_model():
+            raise RuntimeError('Vosk 中文模型未就绪')
+        recognizer = self._vosk.KaldiRecognizer(self._model, 16000)
+        phrases = []
+        for block in pcm:
+            if recognizer.AcceptWaveform(block):
+                phrases.append(json.loads(recognizer.Result()).get('text', ''))
+        phrases.append(json.loads(recognizer.FinalResult()).get('text', ''))
+        return ' '.join(filter(None, phrases))
 
     def stats(self) -> dict:
         """录音统计（供 UI 提示）：时长秒、峰值、是否捕捉到声音"""

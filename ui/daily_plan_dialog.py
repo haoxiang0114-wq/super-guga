@@ -1,5 +1,5 @@
 """Editable recurring checklist; all changes persist through DailyPlan."""
-from datetime import date, timedelta
+from datetime import timedelta
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QLineEdit, QCheckBox, QMessageBox, QInputDialog)

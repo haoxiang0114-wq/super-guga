@@ -196,7 +196,7 @@ class Arena:
                 card = zone[action.index]
             values = [0.] * VALUE_DIM
             if card is not None:
-                d = game.db.get(card.card_id)
+                game.db.get(card.card_id)
                 values = [getattr(card, "atk", 0) / 30, getattr(card, "health", 0) / 30,
                           getattr(card, "tech_level", 1) / 6,
                           *[float(card.has(tag)) for tag in keyword_tags],

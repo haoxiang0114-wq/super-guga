@@ -10,7 +10,13 @@ class UIAUnavailable(RuntimeError):
 
 
 class UIABackend:
-    def __init__(self, ttl=30):
+    # 豆包真实输入框不是 Edit：它是 Group + tiptap ProseMirror，可聚焦、有
+    # TextPattern、没有 ValuePattern。只按 Edit 找会定位不到，所以先认类名特征，
+    # 再退回普通可编辑控件。顺序即优先级，Group 在最前（Edit 只是最后兜底）。
+    COMPOSER_CLASS_HINTS=('prosemirror','tiptap','ql-editor','draftjs','contenteditable')
+    COMPOSER_TYPES=('Group','Document','Edit','ComboBox')
+
+    def __init__(self, ttl=180):
         self.ttl=ttl
         self.lock=threading.RLock()
         self.loaded=False
@@ -95,7 +101,7 @@ class UIABackend:
                 element=queue.popleft();visited+=1
                 item,_=self._entry(element,hwnd,visited,cached=True)
                 if item:
-                    items.append(item);self.elements[item['ref']]=(element,now,hwnd)
+                    items.append(item);self.elements[item['ref']]=(element,now,hwnd,dict(item))
                 try:child=self.walker.GetFirstChild(element,self.cache)
                 except Exception:child=None
                 count=0
@@ -127,7 +133,7 @@ class UIABackend:
         for element in found:
             item,_=self._entry(element,hwnd,cached=True)
             if item:
-                self.elements[item['ref']]=(element,time.monotonic(),hwnd)
+                self.elements[item['ref']]=(element,time.monotonic(),hwnd,dict(item))
                 if include_offscreen or not item['offscreen']:matches.append((element,item))
         if not control_type:
             actionable=[x for x in matches if x[1]['type'] not in ('Text','Pane','Group','Document','Window')]
@@ -142,6 +148,9 @@ class UIABackend:
                 element=cached[0].GetUpdatedCache(self.cache)
                 item,_=self._entry(element,hwnd,cached=True)
                 if item and item['ref']==ref and (include_offscreen or not item['offscreen']):
+                    expected=cached[3] if len(cached)>3 else {}
+                    if any(item.get(key)!=expected[key] for key in ('name','id','type','password') if key in expected):
+                        raise RuntimeError('控件内容或身份已变化，请重新读取目标，未发送操作')
                     if name and item['name']!=name:raise RuntimeError('控件名称已变化，未发送操作')
                     if automation_id and item['id']!=automation_id:raise RuntimeError('控件ID已变化，未发送操作')
                     if control_type and item['type'].lower()!=control_type.lower():raise RuntimeError('控件类型已变化，未发送操作')
@@ -196,6 +205,111 @@ class UIABackend:
         with self.lock:
             _,item=self._resolve(hwnd,**selector)
             return dict(hwnd=int(hwnd),element=item,verified=True)
+
+    def _first_editable(self,hwnd,types=('Edit','ComboBox')):
+        """第一个可见、可用、非密码的可填写控件；找不到就明说，不瞎猜。"""
+        hwnd=int(hwnd)
+        for kind in types:
+            try:found=self._find(hwnd,control_type=kind)
+            except ValueError:continue
+            for element,item in found:
+                if item.get('enabled') and not item.get('password') and not item.get('offscreen'):
+                    return dict(hwnd=hwnd,element=item)
+        raise RuntimeError('没有找到可填写的输入控件，请先点开目标窗口，未发送操作')
+
+    def first_edit(self,hwnd):
+        """普通文本框兜底：没有 ProseMirror 特征时用这个，仍要求唯一可见。"""
+        return self._first_editable(hwnd,('Edit','ComboBox'))
+
+    def composer(self,hwnd):
+        """按真实控件特征定位聊天输入框，而不是「树里第一个 Edit」。
+
+        豆包/网页版对话输入框多为 Group + ProseMirror：可聚焦、有 TextPattern、
+        没有 ValuePattern。先按 COMPOSER_CLASS_HINTS 认类名；一个都认不到时才退回
+        普通可编辑控件（_first_editable），避免在多输入框页面里选错目标。
+        """
+        hwnd=int(hwnd)
+        hints=tuple(hint.casefold() for hint in self.COMPOSER_CLASS_HINTS)
+        with self.lock:
+            root=self._root(hwnd)
+            matches=[]
+            for kind in self.COMPOSER_TYPES:
+                try:found=self._find(hwnd,control_type=kind,root=root)
+                except ValueError:continue
+                for element,item in found:
+                    if not item.get('enabled') or item.get('password') or item.get('offscreen'):continue
+                    class_name=str(item.get('class_name') or '').casefold()
+                    if any(hint in class_name for hint in hints):matches.append((element,item))
+            if not matches:return self._first_editable(hwnd)
+            if len(matches)>1:raise RuntimeError('输入框不唯一，请说具体名称，未发送操作')
+            return dict(hwnd=hwnd,element=matches[0][1])
+
+    def text_of(self,hwnd,ref,limit=4000):
+        """读同一个控件的 TextPattern；读不到就抛错，绝不回退到整页文本。"""
+        from System.Windows.Automation import TextPattern
+        limit=max(1,min(int(limit),20000))
+        with self.lock:
+            element,item=self._resolve(hwnd,ref=ref)
+            try:pattern=element.GetCurrentPattern(TextPattern.Pattern)
+            except Exception:
+                raise RuntimeError('控件不提供 TextPattern，无法同源回读，未发送操作') from None
+            try:value=str(pattern.DocumentRange.GetText(limit+1))
+            except Exception:
+                raise RuntimeError('控件文本读取失败，请先核对，未发送操作') from None
+            return dict(hwnd=int(hwnd),ref=item['ref'],text=value[:limit],
+                        truncated=len(value)>limit,source='uia_text')
+
+    def value(self,hwnd,ref):
+        """读同一个控件的 ValuePattern（普通 Edit 字段）。"""
+        with self.lock:
+            element,item=self._resolve(hwnd,ref=ref)
+            try:pattern=element.GetCurrentPattern(self.Patterns['set_value'].Pattern)
+            except Exception:
+                raise RuntimeError('控件不提供 ValuePattern，请改用同源文本回读，未发送操作') from None
+            try:value=str(pattern.Current.Value or '')
+            except Exception:
+                raise RuntimeError('控件当前值读取失败，请先核对，未发送操作') from None
+            return dict(hwnd=int(hwnd),ref=item['ref'],value=value,source='uia_value')
+
+    def scroll_state(self,hwnd):
+        """只读的 ScrollPattern 读数；拿不到就是 available=False，由调用方兜底。"""
+        hwnd=int(hwnd)
+        with self.lock:
+            for kind in ('Document','Pane','List'):
+                try:found=self._find(hwnd,control_type=kind)
+                except ValueError:continue
+                for element,item in found:
+                    try:
+                        pattern=element.GetCurrentPattern(self.Patterns['scroll'].Pattern)
+                        current=pattern.Current
+                    except Exception:continue
+                    vertical=float(current.VerticalScrollPercent)
+                    return dict(hwnd=hwnd,available=vertical>=0,
+                                percent=(vertical if vertical>=0 else None),
+                                horizontal=float(current.HorizontalScrollPercent),
+                                view_size=float(current.VerticalViewSize),
+                                scrollable=bool(current.VerticallyScrollable or current.HorizontallyScrollable),
+                                ref=item.get('ref'),source='uia_scroll')
+            return dict(hwnd=hwnd,available=False,error='no_scroll_pattern')
+
+    def text(self,hwnd,limit=6000):
+        """整页文本（只读）。优先最大的 Document，其次 Pane；读不到返回空串。"""
+        from System.Windows.Automation import TextPattern
+        hwnd=int(hwnd);limit=max(1,min(int(limit),20000))
+        with self.lock:
+            candidates=[]
+            for kind in ('Document','Pane'):
+                try:candidates.extend(self._find(hwnd,control_type=kind))
+                except ValueError:continue
+            for element,item in candidates:
+                try:
+                    pattern=element.GetCurrentPattern(TextPattern.Pattern)
+                    value=str(pattern.DocumentRange.GetText(limit+1))
+                except Exception:continue
+                if value.strip():
+                    return dict(hwnd=hwnd,text=value[:limit],truncated=len(value)>limit,
+                                ref=item.get('ref'),source='uia_text')
+            return dict(hwnd=hwnd,text='',truncated=False,source='uia_text')
 
     def perceive(self,hwnd,limit=160):
         """Read visible controls in one native cache batch; never take an action."""
@@ -287,7 +401,7 @@ class UIABackend:
             item,_=self._entry(element,hwnd,cached=True)
             if not item or item['password'] or item['type'] not in ('Edit','ComboBox'):
                 raise RuntimeError('当前焦点不是可填写的普通输入框，请先点击目标输入框')
-            self.elements[item['ref']]=(element,time.monotonic(),int(hwnd))
+            self.elements[item['ref']]=(element,time.monotonic(),int(hwnd),dict(item))
             try:
                 value,_,source=self._input_value(element)
                 item['value']=value[:4000];item['value_truncated']=len(value)>4000
@@ -311,7 +425,7 @@ class UIABackend:
                 item,stored=self._entry(node,hwnd,0,cached=False)
                 if not item:break
                 chain.append(item)
-                if stored is not None:self.elements[item['ref']]=(stored,time.monotonic(),hwnd)
+                if stored is not None:self.elements[item['ref']]=(stored,time.monotonic(),hwnd,dict(item))
                 try:node=self.walker.GetParent(node)
                 except Exception:break
             if not chain:raise RuntimeError('鼠标位置的控件已经失效')

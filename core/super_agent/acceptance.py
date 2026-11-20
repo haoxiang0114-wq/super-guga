@@ -212,7 +212,6 @@ class AcceptanceLedger:
         reasons = []
         verdict = PASS
 
-        checks = record.get('check_results') or record.get('checks') or []
         if not record.get('checks'):
             verdict = UNVERIFIED
             reasons.append('没有声明任何检查命令：不做"看起来完成了"的放行')
@@ -220,7 +219,6 @@ class AcceptanceLedger:
             if len(record.get('check_results') or []) != len(record.get('checks')):
                 verdict = UNVERIFIED
                 reasons.append('检查还没有全部执行（先 run_checks）')
-                checks = []
             for result in record.get('check_results') or []:
                 if result.get('ok'):
                     continue

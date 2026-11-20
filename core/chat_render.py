@@ -117,7 +117,6 @@ def _list_block(lines, i, n, indent):
     items = []
     while i < n:
         raw = lines[i]
-        current = len(raw) - len(raw.lstrip())
         match = re.match(r'^(\s*)(?:(\d+)[.)]|[-*+])\s+(.*)$', raw)
         if not match or len(match.group(1)) != indent:
             break

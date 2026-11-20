@@ -1,0 +1,30 @@
+{
+  "name": "sing",
+  "source": "G:\\下载文件\\豆包画图 (6).mp4",
+  "source_sha256": "a865639f8d24291d3150ea35d73b40aecebb1ee1d5ceebd61cded4699234654b",
+  "frames": 241,
+  "native_fps": 24.0,
+  "source_start": 0.0,
+  "source_end": 10.0,
+  "canvas": [
+    320,
+    416
+  ],
+  "reference_width": 245,
+  "baseline": 408,
+  "body_height": 304.36,
+  "edge_clipped_frames": 0,
+  "model": "u2netp-local",
+  "source_pixels_preserved": true,
+  "interpolation": false,
+  "video_audio_used": false,
+  "seconds": 60.66,
+  "review": "approved",
+  "cached_candidate": "runtime\\ui-personality-20261114\\candidates-v2\\sing",
+  "source_frame_offset": 0,
+  "floor_cleanup_pixels": 10362,
+  "final_floor_cleanup_band": [
+    400,
+    416
+  ]
+}

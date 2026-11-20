@@ -33,9 +33,9 @@ def extension_tools():
                  query=dict(type='string'),title=dict(type='string'),content=dict(type='string')),
                  required=['action'],additionalProperties=False)),
         dict(name='dsh_gateway',
-             description='直连本机 DSH web 网关（127.0.0.1:3080，0 重启）：create 新建一个空会话并返回 session_id；start 新建会话并立刻投第一条指令；prompt 向指定会话投递一条用户消息（写操作，必须给出 session_id，不允许猜目标）；status/session 用于查看。要新建 DSH 对话请用 create/start，不要用桌面控制在 DSH 窗口里点按钮。',
+             description='直连本机 DSH web 网关（127.0.0.1:3080，0 重启）：create 新建一个空会话并返回 session_id；start 新建会话并立刻投第一条指令；prompt 向指定会话投递一条用户消息（写操作，必须给出 session_id，不允许猜目标）；status/session 用于查看；cancel 仅中断明确 session_id 的本轮任务并保留会话。要新建 DSH 对话请用 create/start，不要用桌面控制在 DSH 窗口里点按钮。',
              inputSchema=dict(type='object',properties=dict(
-                 action=dict(type='string',enum=['status','session','prompt','create','start']),
+                 action=dict(type='string',enum=['status','session','prompt','create','start','cancel']),
                  session_id=dict(type='string'),text=dict(type='string'),
                  mode=dict(type='string',enum=['queue','steer']),query=dict(type='string')),
                  required=['action'],additionalProperties=False)),
@@ -55,27 +55,71 @@ def self_tools():
     from core.self_agent import TOOLS
     result=[dict(name=t['function']['name'], description=t['function']['description'],
                  inputSchema=t['function']['parameters'])
-            for t in TOOLS if t['function']['name'] in ('app_state', 'pet_control', 'workspace', 'applications', 'computer', 'wechat', 'pet_say', 'daily_plan', 'dsh_task')]
+            for t in TOOLS if t['function']['name'] in ('app_state', 'pet_control', 'workspace', 'applications', 'computer',
+                'browser', 'wechat', 'pet_say', 'daily_plan', 'dsh_task', 'codex_task', 'agent_skills', 'workflow_catalog')]
     result.extend(extension_tools())
+    result.append(dict(name='chat_control',description='程序控制咕嘎真实聊天入口：new 新建独立对话，send 经原路由提交消息（request_id 防重复），state 读取所属对话及真实 DSH 回执，stop 中断当前明确对话的任务。用于本机验收；不要让执行中的智能体向自己递归派单。',
+        inputSchema=dict(type='object',properties=dict(action=dict(type='string',enum=['new','send','state','stop','reporting','present_result','alignment','board_state']),
+            choice=dict(type='integer',minimum=0,maximum=3),supplement=dict(type='string'),capture=dict(type='boolean'),
+            backend=dict(type='string',enum=['guga','codex','dsh']),
+            goal=dict(type='string'),since=dict(type='number'),
+            enabled=dict(type='boolean'),interval_seconds=dict(type='integer'),phase=dict(type='string',enum=['task','processing','submission']),
+            work_directory=dict(type='string'),duration_seconds=dict(type='number'),
+            name=dict(type='string'),conversation_id=dict(type='string'),text=dict(type='string'),
+            request_id=dict(type='string'),limit=dict(type='integer')),required=['action'],additionalProperties=False)))
     result.append(dict(name='voice_session',description='控制咕嘎自己的实时语音会话；start受当前免费额度保护约束，status查看真实状态，stop结束通话；不自动重试。',
         inputSchema=dict(type='object',properties=dict(action=dict(type='string',enum=['start','status','stop'])),
                          required=['action'],additionalProperties=False)))
-    result.append(dict(name='screen_share',description='长语音通话默认启用的辅助屏幕上下文。start仅用于当前长通话，2—5帧/秒本地采集，status/context/snapshot/stop控制；不显示预览、不保存录制。',
+    result.append(dict(name='screen_share',description='控制当前长通话的屏幕共享。火山 Seed Realtime 按 2 帧/秒发送前台窗口 JPEG，其他平台沿用本地采集及视觉摘要。画面只在内存中保留。',
         inputSchema=dict(type='object',properties=dict(action=dict(type='string',enum=['start','status','stop','context','assist','snapshot']),
             fps=dict(type='integer'),max_age=dict(type='integer')),required=['action'],additionalProperties=False)))
     return result
 
 
-def plugin_tools():
-    return self_tools()+[dict(name='dsh_host_event',description='宿主内部生命周期回执，不向模型注册。',inputSchema=dict(
+# 原生 DSH 执行器允许调用的咕嘎工具（A1）。这是模型可见工具面的收敛，不是完整权限隔离：
+# app_state 仍需按任务裁剪，workspace/applications 的动作级权限和 IPC 身份授权在 A2 处理。
+NATIVE_EXECUTOR_TOOL_NAMES = (
+    'app_state',
+    'workspace',
+    'applications',
+    'computer',
+    'wechat',
+    'desktop_command',
+)
+
+
+def native_executor_tools():
+    """原生 DSH 模型可见的执行器工具；schema 直接引用既有定义，不在此重写。
+
+    允许清单之外的工具（聊天控制、再次派单、直接播报等）一律不返回。缺少既有定义时
+    直接报错，避免工具面悄悄缩小。控制器用的 self_tools() 不受影响。
+    """
+    from core.self_agent import TOOLS
+    by_name={t['function']['name']:dict(name=t['function']['name'],description=t['function']['description'],
+                                         inputSchema=t['function']['parameters']) for t in TOOLS}
+    by_name.update({t['name']:t for t in extension_tools()})
+    missing=[name for name in NATIVE_EXECUTOR_TOOL_NAMES if name not in by_name]
+    if missing:
+        raise RuntimeError('原生执行器工具定义缺失: '+', '.join(missing))
+    return [by_name[name] for name in NATIVE_EXECUTOR_TOOL_NAMES]
+
+
+def host_event_tool():
+    """宿主内部生命周期回执定义；插件 apply() 必须排除，不注册给模型。"""
+    return dict(name='dsh_host_event',description='宿主内部生命周期回执，不向模型注册。',inputSchema=dict(
         type='object',properties={key:dict(type='integer' if key in ('turn','step') else 'string') for key in
-        ('session_id','parent_session_id','event_id','kind','state','goal','summary','tool','reason','turn','step')},required=['session_id','kind'],additionalProperties=False))]
+        ('session_id','parent_session_id','event_id','kind','state','goal','summary','tool','reason','turn','step')},required=['session_id','kind'],additionalProperties=False))
+
+
+def plugin_tools():
+    """原生 DSH 插件工具面：执行器允许清单 + 仅宿主使用的 dsh_host_event。"""
+    return native_executor_tools()+[host_event_tool()]
 
 
 def dsh_tools():
     from core.self_agent import TOOLS
     allowed={'app_state','pet_control','pet_say','daily_plan','workspace','applications','computer','local_computer','screen_share',
-             'browser','wechat','web_search','task_plan','music_performance','dsh_task'}
+             'browser','wechat','web_search','task_plan','music_performance','dsh_task','codex_task'}
     result=[dict(name=t['function']['name'],description=t['function']['description'],inputSchema=t['function']['parameters'])
             for t in TOOLS if t['function']['name'] in allowed]
     result.extend(extension_tools())

@@ -1,0 +1,16 @@
+{
+  "schema": "guga.doubao_mcp/1",
+  "enabled": false,
+  "note": "豆包桌面端的“连接器”是客户端方向（豆包调用外部 MCP），它本身不对外提供 MCP Server；本机也未发现监听端口。这里留作可选调用端点：如果以后拿到豆包的 MCP/HTTP 端点，填好 enabled/transport/endpoint(或 command)/tool 即可自动优先走接口通道。未配置时 doubao_adapter 会明确返回 mcp_unavailable 并回落界面自动化。",
+  "server_name": "doubao",
+  "transport": "http",
+  "endpoint": "",
+  "headers": {},
+  "command": "",
+  "args": [],
+  "env": {},
+  "cwd": "",
+  "tool": "",
+  "prompt_argument": "prompt",
+  "call_timeout_seconds": 60
+}

@@ -7,14 +7,22 @@
       "frames": "doze/frames",
       "native_fps": 24.0,
       "reference_width": 245,
-      "weight": 0.8
+      "weight": 0.8,
+      "placement": {
+        "body_height": 358,
+        "ground_y": 408
+      }
     },
     {
       "name": "heart",
       "frames": "heart/frames",
       "native_fps": 24.0,
       "reference_width": 245,
-      "weight": 1.0
+      "weight": 1.0,
+      "placement": {
+        "body_height": 351,
+        "ground_y": 408
+      }
     },
     {
       "name": "pout",

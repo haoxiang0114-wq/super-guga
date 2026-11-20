@@ -275,7 +275,6 @@ def _is_admin():
 
 def self_test() -> str:
     """拔线自检：完整链路逐步记录，返回报告文本（供企鹅右键菜单调用）"""
-    import os as _os
     import time as _time
     lines = []
     lines.append(f"[自检 {_time.strftime('%H:%M:%S')}] 管理员={_is_admin()}")

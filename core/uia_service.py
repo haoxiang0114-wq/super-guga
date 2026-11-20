@@ -71,6 +71,12 @@ class UIAService:
     def focused(self,hwnd):return self.call('focused',hwnd)
     def page_input(self,hwnd,search=False):return self.call('page_input',hwnd,search=search)
     def input_target(self,hwnd,search=False):return self.call('input_target',hwnd,search=search)
+    def first_edit(self,hwnd):return self.call('first_edit',hwnd)
+    def composer(self,hwnd):return self.call('composer',hwnd)
+    def text_of(self,hwnd,ref,limit=4000):return self.call('text_of',hwnd,ref=ref,limit=limit)
+    def value(self,hwnd,ref):return self.call('value',hwnd,ref=ref)
+    def scroll_state(self,hwnd):return self.call('scroll_state',hwnd)
+    def text(self,hwnd,limit=6000):return self.call('text',hwnd,limit=limit)
     def perceive(self,hwnd,limit=160,timeout=1.5):return self.call('perceive',hwnd,timeout=timeout,limit=limit)
     def element_from_point(self,x,y,depth=6):return self.call('element_from_point',timeout=1.2,x=int(x),y=int(y),depth=depth)
     def act(self,hwnd,operation,**arguments):return self.call('act',hwnd,operation=operation,**arguments)
@@ -113,7 +119,8 @@ def serve():
                 request=json.loads(line);method=request['method'];hwnd=int(request.get('hwnd',0))
                 if backend is None:backend=UIABackend()
                 if method=='warmup':result=dict(ready=True)
-                elif method in ('snapshot','read','focused','page_input','input_target','perceive','element_from_point','act','wait'):
+                elif method in ('snapshot','read','focused','page_input','input_target','perceive','element_from_point','act','wait',
+                                'first_edit','composer','text_of','value','scroll_state','text'):
                     if method=='act':
                         import win32gui
                         if win32gui.GetForegroundWindow()!=hwnd:raise RuntimeError('前台窗口已变化，未发送操作')

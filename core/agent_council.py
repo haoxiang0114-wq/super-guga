@@ -1,5 +1,5 @@
 """Bounded, tool-free discussion between persisted Guga identities."""
-import json,threading,time
+import threading
 from urllib.parse import urlsplit
 import requests
 from PyQt5.QtCore import QObject,pyqtSignal

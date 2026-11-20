@@ -11,6 +11,7 @@ import os
 import time
 from collections import OrderedDict
 from ui.avatar_motion import AvatarMotion
+from ui.executor_appearance import draw_executor_accessory
 from PyQt5.QtCore import Qt, QPointF, QRectF, QTimer
 from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QPainterPath, QRadialGradient, QLinearGradient
 
@@ -57,6 +58,24 @@ class SpriteAnimator:
         from core.task_animation import TaskAnimationDirector
         self._task_motion=TaskAnimationDirector()
         self._being_dragged=False
+        self._walking=False
+        self.on_walk_requested=None
+        self.on_work_started=None
+        self.auto_walk=True
+        self.natural_actions=True
+        self._walk_countdown=random.uniform(35.,70.)
+        self._natural_pause = 0.0
+        self._last_task_variant=None
+        self.work_activity='working'
+        self._walk_direction=1
+        self._walk_phase=0.
+        self._face_details=None
+        self._native_face = None
+        self._fade_surface = None
+        self._gaze = (0., 0.)
+        self._pointer_near = False
+        self._blink_at = random.uniform(2.2, 4.2)
+        self._mouth_pose = 0.
         self._speaking=False
         self._hand_blend=0.
         self._hand_releasing=False
@@ -124,12 +143,13 @@ class SpriteAnimator:
         self._prev_expression = "normal"
         self._transition = 1.0
         self._transition_speed = 0.06
-        # 常驻动画链：一段原生片段放完立刻接下一段，并做 250ms 交叉淡入。
+        # 常驻动画链：原生片段接续时短暂混合两段画面。
         # 这才是"常态是动态表情"——不是静止贴图 + 偶尔播一段。
         self._idle_chain = True
         self._xfade_pm = None
         self._xfade_t = 1.0
-        self._xfade_seconds = 0.25
+        self._xfade_seconds = 0.16
+        self._xfade_y = 0
 
         # 企鹅动画参数
         self.breath_y = 0.0
@@ -150,15 +170,16 @@ class SpriteAnimator:
         self._action_phase = 0.0
         self._peek_side = 1
         self.head_yaw = self.head_nod = self.head_tilt = 0.0
+        self.executor_appearance = 'guga'
+        self._executor_caps = {}
+        self._hat_anchors = {}
         self.sunglasses = False
         self._sunglasses_until = 0.0
         self._music_stage_active = False
         self._dancing = False
         self.dance_bpm = 110.0
 
-        # 眨眼 / 翅膀抖
-        self._blink_countdown = random.uniform(2.5, 6.0)
-        self._blink_closing = False
+        # Source artwork owns the eyes; only the wings receive idle motion.
         self._wing_twitch_countdown = random.uniform(3.0, 9.0)
         self._wing_twitch_active = False
         self._wing_twitch_duration = 0.0
@@ -172,9 +193,10 @@ class SpriteAnimator:
         self._clip_started_at = None
         self._idle_rest = None
         self._last_native_pm = None
+        self._last_native_y = self._idle_rest_y = 0
         self._resident_pad = (0,0)
-        self._resident_return_at = None
         self._last_idle_motion = None
+        self._idle_playlist = []
         self._track_dy = 0.0
         self._track_squash = 1.0
         self._track_rot = 0.0
@@ -194,6 +216,9 @@ class SpriteAnimator:
         # natural idle playback. Keep that scope separate from task-video policy.
         self._idle_motion_enabled=True
         self._load_idle_clips()
+        self._load_personality_clips()
+        from ui.pet_effects import PetEffects
+        self.effects = PetEffects()
 
         # 常态表情来回切换
         self._idle_expr_countdown = random.uniform(4.0, 9.0)
@@ -205,13 +230,17 @@ class SpriteAnimator:
 
         self._timer = QTimer()
         self._timer.setInterval(33)
+        self._timer.setTimerType(Qt.PreciseTimer)
         self._timer.timeout.connect(self._tick)
         self._last_tick=time.monotonic()
         # Idle breathing/sway has a 4s period, so 10fps is visually identical to
         # 20fps while halving the transparent-window repaints on an idle desktop.
         # _tick() clamps dt to 0.12s, so 100ms stays inside the integration budget.
-        self._active_interval_ms=33
-        self._idle_interval_ms=100
+        self._active_interval_ms=16
+        # 2026-11-20：原来空闲档 100ms（10fps）。对 4 秒周期的呼吸"理论上"看不出差别，
+        # 但配上现在这套高光立绘，10fps 会把缓慢位移切成肉眼可见的台阶——用户说的
+        # "普通模式抖动、卡顿"就是这个。25fps 下同样的呼吸是连续的，重绘成本仍很低。
+        self._idle_interval_ms=40
 
     @property
     def _src(self):
@@ -223,18 +252,43 @@ class SpriteAnimator:
     def stop(self):
         self._timer.stop()
 
-    def look_at(self, x, y):
+    def look_at(self, x, y, nearby=False):
         self._presence.look_at(x, y)
+        if nearby and not self._pointer_near and self.expression != 'sleepy':
+            self._idle_rest = None
+            # The scheduled idle chain can yield to attention; keep explicit actions.
+            if self._clip and self._clip.startswith('idle:') and self.action == 'none':
+                self.stop_clip()
+        self._pointer_near = nearby
 
     def set_dragging(self, active, speed=0.0):
-        # Movement is handled by the window; no shaking/tilt animation on drag.
         self._being_dragged=bool(active)
         if active:self._idle_rest=None
         if active and (self._clip or '').startswith('task:'):self.stop_clip()
-        self._presence.set_dragging(False, 0.)
+        self._presence.set_dragging(active, max(-85.,min(85.,speed)) if active else 0.)
         if active and (self._clip or '').startswith('idle:'):self.stop_clip()
+        if active and (self._clip or '').startswith('personality:'):self.stop_clip()
+
+    def set_walking(self, active, direction=1):
+        self._walking=bool(active)
+        self._walk_direction=1 if direction>=0 else -1
+        if active:
+            self._idle_rest=None
+            if (self._clip or '').startswith(('idle:','personality:')):self.stop_clip()
+            self.play_personality('walk')
+        elif self._clip=='personality:walk':self.stop_clip(natural=True)
+
+    def _face_frame(self):
+        if self._face_details is None:
+            from ui.pet_face import FaceDetails
+            self._face_details = FaceDetails(self._res_dir, self._dw, self._dh)
+        mouth = self._mouth_pose if self._speaking else 0.
+        return self._face_details.frame(self.expression, self.eye_open, mouth, self._gaze, self._speaking)
 
     def set_work_state(self,state,task_id='main'):
+        if state in ('thinking','working','waiting') and self.on_work_started:self.on_work_started()
+        if state in ('thinking','working','waiting') and self._walking:self.set_walking(False)
+        if state in ('thinking','working','waiting') and not self._task_motion.jobs:self._last_task_variant=None
         if state in ('thinking','working','waiting'):self._idle_rest=None
         if state in ('thinking','working','waiting','result','success','error') and (self._clip or '').startswith('idle:'):
             self.stop_clip()
@@ -242,18 +296,26 @@ class SpriteAnimator:
         if state in ('idle','cancelled','success','error','result') and not self._task_motion.jobs:
             self._hand_releasing=True
             if state in ('idle','cancelled') and (self._clip or '').startswith('task:'):self.stop_clip()
+            if self._clip=='personality:work':self.stop_clip(natural=True)
         return applied
 
     def set_speaking(self,active):
         self._speaking=bool(active)
+        self.eye_open=1.0
         if active:self._idle_rest=None
         if active:self._hand_releasing=True
-        if active and (self._clip or '').split(':',1)[0] in ('task','idle'):self.stop_clip()
+        if active and ((self._clip or '').split(':',1)[0] in ('task','idle') or self._clip=='personality:work'):self.stop_clip()
 
     def set_music_stage(self,active):
         """Singing latches the accessory until the real audio state ends."""
         self._music_stage_active=bool(active)
         if active:self._idle_rest=None
+        if 'personality:sing' in self.clips:
+            self.sunglasses=False
+            if active:
+                if self._clip!='personality:sing':self.play_personality('sing')
+            elif self._clip=='personality:sing':self.stop_clip(natural=True)
+            return
         if active:
             if (self._clip or '').startswith('idle:'):self.stop_clip()
             self.sunglasses=True
@@ -269,8 +331,44 @@ class SpriteAnimator:
         self.play_clip(clip,loop=False)
         return self._clip==clip
 
+    def _load_personality_clips(self):
+        import json
+        from pathlib import Path
+        base=Path(self._res_dir)/'actions/personality-20261114'
+        try:
+            manifest=json.loads((base/'manifest.json').read_text(encoding='utf-8'))
+            for name in ('entrance','poke','sing'):
+                spec=manifest['clips'][name]
+                folder=(base/spec['frames']).resolve()
+                if not folder.is_relative_to(base.resolve()):continue
+                fps=float(spec['fps'])
+                if not 20<=fps<=60:continue
+                self._load_action_frames('personality:'+name,str(folder),fps,lazy=True,
+                                         reference_width=manifest['reference_width'], placement=spec.get('placement'))
+        except (OSError,ValueError,TypeError,KeyError):return
+        base=Path(self._res_dir)/'actions/task-walk-20261116'
+        try:
+            manifest=json.loads((base/'manifest.json').read_text(encoding='utf-8'))
+            for name in ('work','walk'):
+                spec=manifest['clips'][name];folder=(base/spec['frames']).resolve()
+                fps=float(spec['fps'])
+                if not folder.is_relative_to(base.resolve()) or not 20<=fps<=60:continue
+                self._load_action_frames('personality:'+name,str(folder),fps,lazy=True,
+                                         reference_width=manifest['reference_width'], placement=spec.get('placement'))
+        except (OSError,ValueError,TypeError,KeyError):pass
+
+    def play_personality(self,name):
+        """Explicit events own the source pose until finished or dragged."""
+        clip='personality:'+name
+        if clip not in self.clips or self._being_dragged:return False
+        if self.expression=='sleepy' and name!='entrance':return False
+        if name in ('work','walk') and (self._music_stage_active or self._speaking):return False
+        self.action='none';self._dancing=False
+        self.play_clip(clip,loop=name=='sing')
+        return self._clip==clip
+
     def _idle_motion_blocked(self):
-        return (self._speaking or self._being_dragged or self._music_stage_active or self.dancing or
+        return (self._speaking or self._being_dragged or self._walking or self._music_stage_active or self.dancing or
             self.mouth_open>.05 or self._task_motion.active or self.expression=='sleepy' or
             self._context_expression not in (None,'happy') or self._temporary_expression is not None)
 
@@ -291,7 +389,7 @@ class SpriteAnimator:
                     # State aliases share decoded pixels, not mutable playback flags.
                     self.clips[name]=dict(self.clips[loaded[key]])
                 else:
-                    self._load_action_frames(name,str(folder),fps)
+                    self._load_action_frames(name,str(folder),fps, placement=spec.get('placement'))
                     if name in self.clips:loaded[key]=name
         except (OSError,ValueError,TypeError,KeyError):return
 
@@ -308,8 +406,9 @@ class SpriteAnimator:
             for spec in manifest.get('clips',[]):
                 name=str(spec.get('name','')).strip();folder=(base/spec['frames']).resolve();fps=float(spec['native_fps'])
                 if not name or not folder.is_relative_to(base.resolve()) or not 20<=fps<=60:continue
+                if 'idle:' + name in self.clips:continue
                 clip='idle:'+name;self._load_action_frames(clip,str(folder),fps,lazy=True,
-                    reference_width=spec.get('reference_width'))
+                    reference_width=spec.get('reference_width'), placement=spec.get('placement'))
                 if clip in self.clips:self.idle_motion_clips.append((name,max(.01,float(spec.get('weight',1)))))
             if manifest.get('padded_canvas'):
                 # 以前是"少于 4 个片段就整组丢弃、退回 idle-motion（245×352、无扩边、按适配盒缩放）"，
@@ -321,6 +420,7 @@ class SpriteAnimator:
                 self._resident_pad=(round(self._dw*40/245),round(self._dw*60/245))
                 self.width=self._dw+2*self._resident_pad[0]
                 self.height=self._dh+self._resident_pad[1]+round(self._dw*12/245)
+                self._load_idle_clips(Path(self._res_dir)/'actions/idle-motion')
         except (OSError,ValueError,TypeError,KeyError):return
 
     def _tick_task_motion(self):
@@ -329,6 +429,16 @@ class SpriteAnimator:
                  self.action!='none' or self._clip not in (None,'idle','talk'))
         event=self._task_motion.poll(blocked)
         if event:
+            if event['state'] in ('thinking','working','waiting') and 'personality:work' in self.clips:
+                # A whole source performance, then a different short gesture.
+                # The board appears for real work/drawing, never random success.
+                choices=['work','tilt','nod','peek'] if event['state']!='waiting' else ['peek','tilt']
+                if self._last_task_variant=='work':choices=[x for x in choices if x!='work']
+                variant='work' if self._last_task_variant is None and 'work' in choices else random.choice(choices)
+                self._last_task_variant=variant
+                if variant=='work':self.play_personality('work')
+                else:self.trigger_action(variant)
+                return
             clip='task:'+event['state']
             if self._reference_clips_enabled and clip in self.clips:self.play_clip(clip,loop=False)
             else:self.trigger_action({'thinking':'tilt','waiting':'peek'}.get(event['state'],event['gesture']))
@@ -336,6 +446,10 @@ class SpriteAnimator:
     def task_animation_status(self):
         return dict(version='2026-11-08.resident-motion.1',active_clip=self._clip,
                     frame=int(self._clip_frame),director=self._task_motion.snapshot(),
+                    personality=dict(version='2026-11-14.personality.1',effects=self.effects.enabled,
+                        loaded={name.split(':',1)[1]:dict(frames=len(clip['frames']),fps=clip['fps'],
+                            loop=bool(clip['loop'])) for name,clip in self.clips.items()
+                            if name.startswith('personality:')}),
                     loaded={name[5:]:dict(frames=len(clip['frames']),fps=clip['fps'],
                                         one_shot=bool(clip.get('one_shot_only')))
                             for name,clip in self.clips.items() if name.startswith('task:')},
@@ -347,6 +461,10 @@ class SpriteAnimator:
                                 for name,_ in self.idle_motion_clips if 'idle:'+name in self.clips}))
 
     def tap(self, amount=.92):
+        # The short compression must start immediately, even while a longer clip starts.
+        self._tap_elapsed = 0.
+        self._tap_amount = max(.88, min(.98, amount))
+        if self.play_personality('poke'):return
         if (self._clip or '').startswith('idle:'):self.stop_clip()
         self._tap_elapsed = 0.
         self._tap_amount = max(.88, min(.98, amount))
@@ -441,29 +559,30 @@ class SpriteAnimator:
                               'frames': [(0, 1.0, -6), (0, 1.0, 0), (0, 1.0, 6), (0, 1.0, 0)]}
 
     def _start_next_idle_motion(self):
-        """接下一段原生常驻片段（避开刚播过的那段）。"""
-        choices = [(n, w) for n, w in self.idle_motion_clips if n != self._last_idle_motion]
-        if not choices:
-            choices = list(self.idle_motion_clips)
-        if not choices:
-            return
-        names = [n for n, _ in choices]
-        weights = [max(.01, w) for _, w in choices]
-        self.play_clip('idle:' + random.choices(names, weights=weights, k=1)[0], loop=False)
+        """Play every available motion before reshuffling the idle sequence."""
+        if not self._idle_playlist:
+            self._idle_playlist = [name for name, _ in self.idle_motion_clips]
+            random.shuffle(self._idle_playlist)
+            if len(self._idle_playlist) > 1 and self._idle_playlist[-1] == self._last_idle_motion:
+                self._idle_playlist[0], self._idle_playlist[-1] = self._idle_playlist[-1], self._idle_playlist[0]
+        if self._idle_playlist:
+            self.play_clip('idle:' + self._idle_playlist.pop(), loop=False)
 
     def play_clip(self, name, loop=None):
         if name.startswith('task:') and not self._reference_clips_enabled:return
         if name.startswith('idle:') and not self._idle_motion_enabled:return
         if name not in self.clips:
             return
-        if name.startswith('idle:'):
-            if self._idle_motion_blocked():return
-            # 上一段的最后一帧留作交叉淡入的起点，避免硬切（这就是"衔接不自然"的来源）
-            previous = self._last_native_pm
-            if previous is not None and (self._clip or '').startswith('idle:'):
-                self._xfade_pm = previous
-                self._xfade_t = 0.0
-            self._last_idle_motion=name[5:]
+        if name.startswith(('idle:', 'personality:', 'task:')):
+            if name.startswith('idle:') and self._idle_motion_blocked():return
+            if name != 'personality:entrance':
+                if self._last_native_pm is not None:
+                    self._fade_from(self._last_native_pm, self._last_native_y)
+                elif self._idle_rest is not None:
+                    self._fade_from(self._idle_rest, self._idle_rest_y)
+                elif self._xfade_pm is None:
+                    self._fade_from(self._src, 0)
+            if name.startswith('idle:'):self._last_idle_motion=name[5:]
             self._idle_rest=None
             self._last_native_pm=None
         self._track_dy=0.;self._track_squash=1.;self._track_rot=0.
@@ -474,13 +593,22 @@ class SpriteAnimator:
         self._clip_started_at = time.monotonic()
 
     def stop_clip(self, natural=False):
-        if (self._clip or '').startswith('idle:'):
-            if natural:
-                frames=self.clips[self._clip]['frames']
-                self._idle_rest=self._last_native_pm or frames[-1]
-                self._resident_return_at=time.monotonic()
-            else:self._idle_rest=None
-            self._last_native_pm=None
+        name = self._clip or ''
+        if name.startswith(('idle:', 'personality:', 'task:')):
+            self._natural_pause = 0.0
+            clip = self.clips[name]
+            frame = self._last_native_pm
+            if frame is None:
+                frames = clip['frames']
+                frame = frames[min(int(self._clip_frame), len(frames) - 1)]
+            frame_y = self._native_y(clip, frame)
+            self._idle_rest = None
+            if natural and name.startswith('idle:'):
+                self._idle_rest = frame
+                self._idle_rest_y = frame_y
+            else:
+                self._fade_from(frame, frame_y)
+            self._last_native_pm = None
         self._clip = None
         self._clip_frame = 0.0
         self._clip_started_at = None
@@ -522,7 +650,7 @@ class SpriteAnimator:
             except Exception:
                 continue
 
-    def _load_action_frames(self, name, frames_dir, fps=15.0, lazy=False, reference_width=None):
+    def _load_action_frames(self, name, frames_dir, fps=15.0, lazy=False, reference_width=None, placement=None):
         """Load a transparent PNG animation without GIF palette loss."""
         if not os.path.isdir(frames_dir):
             return
@@ -535,9 +663,15 @@ class SpriteAnimator:
             return
         paths=[os.path.join(frames_dir,filename) for filename in sorted(os.listdir(frames_dir))
                if filename.lower().endswith('.png')]
+        scale = self._dh / float(placement['body_height']) if placement else None
+
         def load_path(path):
             with PILImage.open(path) as source:
-                return self._pil_to_pixmap(source.convert('RGBA'),reference_width=reference_width)
+                frame = source.convert('RGBA')
+                if placement and 'neck_y' in placement:
+                    frame = self._align_native_body(frame, placement, scale)
+                    return self._pil_to_pixmap(frame, scale=1.0)
+                return self._pil_to_pixmap(frame, reference_width=reference_width, scale=scale)
         if lazy:
             frames=LazyFrameSequence(paths,load_path)
         else:
@@ -553,13 +687,39 @@ class SpriteAnimator:
             self.clips[name] = {'type': 'frames', 'frames': frames,
                                 'fps': float(fps), 'loop': not once,'one_shot_only':once}
 
-    def _pil_to_pixmap(self, pil_img, reference_width=None):
+            if placement:
+                self.clips[name]['ground_y'] = round(placement['ground_y'] * scale)
+
+    def _align_native_body(self, frame, placement, scale):
+        from PIL import Image
+        top = placement['head_top']
+        neck = placement['neck_y']
+        ground = placement['ground_y']
+        # Keep the hood crown and feet on their shared marks. The blackboard
+        # take has a longer head, so match the collar before playing the take.
+        head_scale = self._dh * placement['neck_fraction'] / (neck - top)
+        lower_scale = self._dh * (1 - placement['neck_fraction']) / (ground - neck)
+        width = round(frame.width * scale * placement.get('width_factor', 1.0))
+        ground_y = round(ground * scale)
+        head_h = round(neck * head_scale)
+        lower_h = round((frame.height - neck) * lower_scale)
+        offset = ground_y - round((ground - neck) * lower_scale) - head_h
+        canvas = Image.new('RGBA', (width, offset + head_h + lower_h))
+        head = frame.crop((0, 0, frame.width, neck)).resize((width, head_h), Image.Resampling.BICUBIC)
+        body = frame.crop((0, neck, frame.width, frame.height)).resize(
+            (width, lower_h), Image.Resampling.BICUBIC)
+        canvas.paste(head, (0, offset))
+        canvas.paste(body, (0, offset + head_h))
+        return canvas
+
+    def _pil_to_pixmap(self, pil_img, reference_width=None, scale=None):
         from PyQt5.QtGui import QImage
         data = pil_img.tobytes('raw', 'RGBA')
         qimg = QImage(data, pil_img.width, pil_img.height, QImage.Format_RGBA8888)
         pm = QPixmap.fromImage(qimg)
-        if reference_width:
-            scale=self._dw/float(reference_width)
+        if scale is None and reference_width:
+            scale = self._dw / float(reference_width)
+        if scale is not None:
             return pm.scaled(round(pm.width()*scale),round(pm.height()*scale),
                 Qt.KeepAspectRatio,Qt.SmoothTransformation)
         scale = min(self._dw / max(1, pm.width()), self._dh / max(1, pm.height()))
@@ -590,6 +750,7 @@ class SpriteAnimator:
     # ==================== 动作控制 ====================
 
     def trigger_action(self, action: str):
+        if (self._clip or '').startswith('personality:'):return
         from core.embodiment import ALIASES
         action=ALIASES.get(action,action)
         if action!='none' and (self._clip or '').startswith('idle:'):self.stop_clip()
@@ -629,6 +790,9 @@ class SpriteAnimator:
 
     def _tick(self):
         now=time.monotonic();dt=max(.001,min(.12,now-self._last_tick));self._last_tick=now
+        # 本帧是否有片段自然放完。自然结束的那一帧必须先把结算姿态显示出来，
+        # 不能在同一帧里又被常驻动画链接上下一段，否则 _idle_rest 永远看不到。
+        self._clip_just_ended=False
         self._tap_elapsed += dt
         self.frame += 1
         t = self._time = self._time + dt
@@ -670,24 +834,15 @@ class SpriteAnimator:
             if self._xfade_t >= 1.0:
                 self._xfade_pm = None
 
-        # ---- 眨眼（normal/happy）----
-        if self.expression in ("normal", "happy") and self._transition > 0.5:
-            self._blink_countdown -= dt
-            if self._blink_countdown <= 0 and not self._blink_closing:
-                self._blink_closing = True
-            if self._blink_closing:
-                self.eye_open -= 6.0*dt
-                if self.eye_open <= 0:
-                    self.eye_open = 0
-                    self._blink_closing = False
-                    self._blink_countdown = -random.uniform(0.05, 0.15)
-            else:
-                if self._blink_countdown < 0:
-                    self.eye_open = min(1.0, self.eye_open + random.uniform(3.6, 6.6)*dt)
-                    if self.eye_open >= 1.0:
-                        self._blink_countdown = random.uniform(3.0, 8.0)
-        else:
-            self.eye_open = 1.0
+        # Close quickly and reopen a little more slowly. Native sequences retain their own eyes.
+        blink_age = t - self._blink_at
+        self.eye_open = 1.
+        if 0 <= blink_age < .18:
+            self.eye_open = min(1., abs(blink_age - .062) / (.067 if blink_age < .062 else .118))
+        elif blink_age >= .18:
+            self._blink_at = t + random.uniform(2.5, 6.2)
+        mouth_target = self.mouth_open if self._speaking else 0.
+        self._mouth_pose += (mouth_target - self._mouth_pose) * (1 - math.exp(-dt * 28))
 
         # ---- 身体挤压回弹 ----
         if self.body_squash < self.body_squash_target:
@@ -709,6 +864,8 @@ class SpriteAnimator:
                 if self._clip=='talk':self.stop_clip()
         else:self._stale_mouth_frames=0;self._stale_mouth_seconds=0.
         presence = self._presence.advance(dt)
+        self._gaze = (presence.head_yaw / 18., presence.head_pitch / 9.)
+        if self._walking:self._walk_phase+=dt*2.15*math.tau
         self.head_yaw += presence.head_yaw / 36
         self.head_nod += presence.head_pitch / 24
         self.anim_rotate += presence.roll
@@ -717,7 +874,7 @@ class SpriteAnimator:
         # ---- 动画剪辑帧推进 ----
         if self._clip is not None:
             c = self.clips[self._clip]
-            if c.get('one_shot_only') and self._clip_started_at is not None:
+            if (c.get('one_shot_only') or self._clip.startswith('personality:')) and self._clip_started_at is not None:
                 self._clip_frame = max(0.,time.monotonic()-self._clip_started_at)*c['fps']
             else:self._clip_frame += dt * c['fps']
             n = len(c['frames'])
@@ -726,6 +883,7 @@ class SpriteAnimator:
                     self._clip_frame %= n
                 else:
                     self.stop_clip(natural=True)
+                    self._clip_just_ended=True
             if c.get('type') == 'track':
                 idx = min(int(self._clip_frame), n - 1)
                 dy, sq, rt = c['frames'][idx]
@@ -736,6 +894,9 @@ class SpriteAnimator:
             self._track_rot = 0.0
 
         # 说话 → 表情动作完全不变，只保留极轻微的身体脉动（talk 轨道已调至几乎不可见）
+        if (self._music_stage_active and not self._being_dragged and
+                self._clip in (None,'idle','talk') and not self._clip_just_ended):
+            self.play_personality('sing')
         if self._clip is None:
             if self.mouth_open > 0.05:
                 self.play_clip('talk', loop=True)
@@ -743,28 +904,35 @@ class SpriteAnimator:
                 self.play_clip('idle', loop=True)
 
         # ---- 常态表情来回切换（空闲时偶尔换脸再换回来）----
-        if (not self._task_motion.active and self.action == "none" and self.mouth_open <= 0.05 and
-                self._clip in (None,'idle') and self._context_expression in (None, 'happy')):
+        idle_chain = self._idle_chain and self._idle_motion_enabled and bool(self.idle_motion_clips)
+        if (not (self.natural_actions and idle_chain) and not self._task_motion.active
+                and self.action == "none" and self.mouth_open <= 0.05
+                and self._clip in (None, 'idle') and self._context_expression in (None, 'happy')):
             self._idle_expr_countdown -= dt
             if self._idle_expr_countdown <= 0:
                 self._idle_expr_countdown = random.uniform(6.0, 14.0)
                 self.temporary_expression(random.choice(['playful', 'surprised', 'happy']),
                                           random.uniform(1.0, 2.2))
 
-        # ---- 常驻连续动画（核心：常态也要是动的）----
+        available = not self._idle_motion_blocked() and self.action == 'none'
+        if available and self.natural_actions and (
+                self._clip in (None, 'idle') or (self._clip or '').startswith('idle:')):
+            self._walk_countdown -= dt
+            if self._clip in (None, 'idle'):
+                self._natural_pause -= dt
+                if self.auto_walk and self._walk_countdown <= 0 and self.on_walk_requested:
+                    self._walk_countdown = random.uniform(40., 90.)
+                    self.on_walk_requested()
+        # ---- 常驻自然动画 ----
         if (not self._task_motion.active and self.expression != 'sleepy' and
                 self._context_expression in (None,'happy') and self._temporary_expression is None and
-                self.action == "none" and not self._idle_motion_blocked() and self._clip in (None, 'idle')):
-            if self._idle_chain and self.idle_motion_clips:
+                self.action == "none" and not self._idle_motion_blocked() and self._clip in (None, 'idle')
+                and not self._clip_just_ended and not self._pointer_near):
+            if self.natural_actions and self._natural_pause <= 0 and idle_chain:
                 self._start_next_idle_motion()
 
-        # ---- 随机小动作（让企鹅活起来）----
-        if (not self._task_motion.active and random.random() < 0.024*dt and self.expression == "normal" and
-                self.action == "none" and self._clip in (None,'idle')):
-            self.set_expression('sleepy')
-
         # 随机小动作：空闲时偶尔蹦一下/偷看（保持动态）
-        if (not self._task_motion.active and self.expression != 'sleepy' and
+        if (self.natural_actions and not idle_chain and not self._task_motion.active and self.expression != 'sleepy' and
                 self._context_expression in (None,'happy') and self._temporary_expression is None and
                 self.action == "none" and not self._idle_motion_blocked() and self._clip in (None, 'idle')):
             self._idle_action_countdown -= dt
@@ -791,10 +959,11 @@ class SpriteAnimator:
         # 10fps 的空闲档只适合程序化的 6fps 呼吸轨；套在 24fps 素材上会丢掉一半多的帧，
         # 看起来就是"自然状态比动图卡、还抖"。
         native_clip = bool((self.clips.get(self._clip or '') or {}).get('type') == 'frames')
-        energetic=bool(self._speaking or self.mouth_open>.05 or self.action!='none' or self.dancing or
+        energetic=bool(self._xfade_t < 1.0 or self._walking or self._speaking or self.mouth_open>.05 or self.action!='none' or self.dancing or
             self._task_motion.active or self._temporary_expression is not None or self._being_dragged or
             self._transition<1 or self._clip not in (None,'idle') or self._tap_elapsed<1.0 or native_clip)
-        target=self._active_interval_ms if energetic else self._idle_interval_ms
+        interactive = self._pointer_near or max(map(abs, self._gaze)) > .025 or t >= self._blink_at - .14
+        target = self._active_interval_ms if energetic or interactive else self._idle_interval_ms
         if self._timer.interval()!=target:self._timer.setInterval(target)
         if self.on_update:
             self.on_update()
@@ -811,7 +980,7 @@ class SpriteAnimator:
         self.head_yaw = self.head_nod = self.head_tilt = 0.0
         if self._sunglasses_until and self._time>=self._sunglasses_until:
             self.sunglasses=False;self._sunglasses_until=0
-        if self._music_stage_active:
+        if self._music_stage_active and 'personality:sing' not in self.clips:
             self.sunglasses=True;self._sunglasses_until=0.
 
         if self.dancing and a=='none' and self._clip != self.DANCE_CLIP:
@@ -930,68 +1099,101 @@ class SpriteAnimator:
     # ==================== 绘制 ====================
 
     def draw(self, p: QPainter, x: int, y: int):
+        clip=self._clip or ''
+        kind=clip.split(':',1)[1] if clip.startswith('personality:') else (
+            'heart' if clip=='idle:heart' else ('bounce' if self.action=='bounce' else ''))
+        age=self._clip_frame/self.clips[clip]['fps'] if clip in self.clips else self._action_timer
+        fx=x+self._resident_pad[0]+self._dw/2
+        fy=y+self._resident_pad[1]+self._dh
+        self.effects.draw(p,kind,age,self._dw,self._dh,fx,fy,behind=True)
+        self._draw_character(p,x,y)
+        self.effects.draw(p,kind,age,self._dw,self._dh,fx,fy)
+
+    def _native_y(self, clip, frame):
+        return self._dh - clip.get('ground_y', frame.height())
+
+    def _fade_from(self, frame, frame_y):
+        self._xfade_pm = frame
+        self._xfade_y = frame_y
+        self._xfade_t = 0.0
+
+    def _draw_pose(self, painter, x, y, frame, frame_y):
+        old = self._xfade_pm
+        blend = self._xfade_t
+        frame_x = round((self._dw - frame.width()) / 2)
+        if old is None or blend >= 1.0:
+            painter.drawPixmap(x + frame_x, y + frame_y, frame)
+            return
+        old_y = self._xfade_y
+        width = max(old.width(), frame.width())
+        top = min(old_y, frame_y)
+        bottom = max(old_y + old.height(), frame_y + frame.height())
+        # Premultiplied addition preserves opacity where both frames overlap.
+        from PyQt5.QtGui import QImage
+        if self._fade_surface is None or (self._fade_surface.width(), self._fade_surface.height()) != (width, bottom - top):
+            self._fade_surface = QImage(width, bottom - top, QImage.Format_ARGB32_Premultiplied)
+        self._fade_surface.fill(Qt.transparent)
+        layer_painter = QPainter(self._fade_surface)
+        layer_painter.setOpacity(1 - blend)
+        layer_painter.drawPixmap(round((width - old.width()) / 2), old_y - top, old)
+        layer_painter.setCompositionMode(QPainter.CompositionMode_Plus)
+        layer_painter.setOpacity(blend)
+        layer_painter.drawPixmap(round((width - frame.width()) / 2), frame_y - top, frame)
+        layer_painter.end()
+        painter.drawImage(x + round((self._dw - width) / 2), y + top, self._fade_surface)
+
+    def _draw_character(self, p: QPainter, x: int, y: int):
         x+=self._resident_pad[0];y+=self._resident_pad[1]
         p.save()
         p.setRenderHint(QPainter.SmoothPixmapTransform, True)
         p.setRenderHint(QPainter.Antialiasing, True)
 
+        # Apply impact before native-frame early returns, so clicks never feel delayed.
+        if self._tap_elapsed < .22:
+            from ui.pet_physics import squash_scale
+            touch=squash_scale(self._tap_elapsed/.22,self._tap_amount)
+            anchor_x=x+self._dw/2;anchor_y=y+self._dh
+            p.translate(anchor_x,anchor_y);p.scale(1+(1-touch)*.5,touch);p.translate(-anchor_x,-anchor_y)
+
         self._draw_shadow(p, x, y)
 
-        # Source video owns its body motion. A completed action keeps its settled
-        # final pose instead of jumping back to a different-sized illustration.
-        native_idle=(self._clip or '').startswith('idle:')
-        settled=(self._idle_rest is not None and self.expression in ('normal','happy') and
-            self.action=='none' and not self._speaking and not self._task_motion.active)
-        if native_idle or settled:
-            if native_idle:
-                frames=self.clips[self._clip]['frames']
-                pm=frames[min(int(self._clip_frame),len(frames)-1)]
-                self._last_native_pm=pm
-            else:pm=self._idle_rest
-            if settled and not native_idle:
-                age=max(0,time.monotonic()-(self._resident_return_at or time.monotonic()))
-                breath=1.+.002*math.sin(age*math.pi/2)*min(1.,age/.25)
-                anchor_x=x+self._dw/2;anchor_y=y+self._dh
-                p.translate(anchor_x,anchor_y);p.scale(breath,breath);p.translate(-anchor_x,-anchor_y)
-            margin=self._dw*8/245 if self._resident_pad!=(0,0) else 0
-            if self._xfade_pm is not None and self._xfade_t < 1.0:
-                old = self._xfade_pm
-                p.setOpacity(max(0.0, 1.0 - self._xfade_t))
-                p.drawPixmap(int(x+(self._dw-old.width())/2),
-                             int(y+self._dh-old.height()+margin), old)
-                p.setOpacity(self._xfade_t)
-            p.drawPixmap(int(x+(self._dw-pm.width())/2),int(y+self._dh-pm.height()+margin),pm)
-            p.setOpacity(1.0)
-            if self.sunglasses:self._draw_sunglasses(p,x,y)
-            p.restore();return
-
-        # Finished source choreography owns its motion. Never add the procedural
-        # head/body deformation that made the previous assembled dance strange.
-        if (self._clip or '').startswith('task:'):
-            frames=self.clips[self._clip]['frames']
-            pm=frames[min(int(self._clip_frame),len(frames)-1)]
-            p.drawPixmap(int(x+(self._dw-pm.width())/2),int(y+self._dh-pm.height()),pm)
-            if self.sunglasses:self._draw_sunglasses(p,x,y)
-            p.restore();return
+        native = (self._clip or '').startswith(('idle:', 'personality:', 'task:'))
+        settled = (self._idle_rest is not None and self.expression in ('normal', 'happy')
+                   and self.action == 'none' and not self._speaking and not self._task_motion.active)
+        fading = self._xfade_pm is not None and self._xfade_t < 1.0
+        if native or settled or (fading and not self._clip):
+            mirrored = native and self._walking and self._walk_direction < 0
+            if mirrored:
+                p.translate(2*x + self._dw, 0)
+                p.scale(-1, 1)
+            if native:
+                clip = self.clips[self._clip]
+                frames = clip['frames']
+                pm = frames[min(int(self._clip_frame), len(frames) - 1)]
+                frame_y = self._native_y(clip, pm)
+                self._last_native_pm, self._last_native_y = pm, frame_y
+            elif settled:
+                pm, frame_y = self._idle_rest, self._idle_rest_y
+            else:
+                pm, frame_y = self._src, 0
+            self._draw_pose(p, x, y, pm, frame_y)
+            frame_x = round((self._dw - pm.width()) / 2)
+            draw_executor_accessory(p, self, x + frame_x, y + frame_y, pm,
+                                    native=True, mirrored=mirrored)
+            if self.sunglasses:
+                self._draw_sunglasses(p, x, y)
+            p.restore()
+            return
 
         cx = x + self._dw / 2
         planted=self.action=='none' and self._clip in (None,'idle','talk')
         cy = y + self._dh if planted else y + self._dh / 2
         sx = 2 - self.body_squash
         sy = self.body_squash
-        if self._tap_elapsed < .22:
-            from ui.pet_physics import squash_scale
-            touch = squash_scale(self._tap_elapsed/.22, self._tap_amount)
-            sx *= 1+(1-touch)*.5
-            sy *= touch
-        breath_scale = 1.0 + math.sin(self._time * 2 * math.pi / 4.0) * 0.005
-
-        # 说话时轻微点头（增加真实感）
-        talk_bob = self.mouth_open * 1.6
-
+        breath_scale = 1.0 if planted else 1.0 + math.sin(self._time * math.tau / 4.0) * .003
         p.translate(cx + self.anim_offset.x(), cy + (0 if planted else self.breath_y) + self.anim_offset.y()
-                    + talk_bob + (0 if planted else self._track_dy))
-        p.rotate(self.body_sway_x * 0.25 + self.anim_rotate + self._track_rot)
+                    + (0 if planted else self._track_dy))
+        p.rotate(self.anim_rotate + self._track_rot)
         sq = self._track_squash
         p.scale(breath_scale * sx * self.anim_scale_x * (2 - sq),
                 breath_scale * sy * self.anim_scale_y * sq)
@@ -1003,14 +1205,30 @@ class SpriteAnimator:
             if frames:
                 idx = min(int(self._clip_frame), len(frames) - 1)
                 pm = frames[idx]
-                p.drawPixmap(int(x + (self._dw - pm.width()) / 2),
-                             int(y + self._dh - pm.height()), pm)
+                frame_x = int(x + (self._dw - pm.width()) / 2)
+                frame_y = int(y + self._dh - pm.height())
+                p.drawPixmap(frame_x, frame_y, pm)
+                draw_executor_accessory(p, self, frame_x, frame_y, pm, native=True)
                 if self.sunglasses:
                     self._draw_sunglasses(p, x, y)
                 p.restore()
                 return
 
-        if self._transition < 1.0:
+        if (not self._being_dragged and not self._walking and self.expression != 'sleepy'
+                and self.action not in ('think_chin', 'scratch_head') and self._draw_native_face(p, x, y)):
+            pass
+        elif self._speaking or self._being_dragged or self._walking or self._pointer_near or max(map(abs, self._gaze)) > .025 or self.eye_open < .99:
+            p.save()
+            if self._walking:
+                p.translate(cx,y+self._dh)
+                p.rotate(2.3*math.sin(self._walk_phase)+self._walk_direction*2)
+                p.translate(-cx,-y-self._dh)
+                p.translate(0,-abs(math.sin(self._walk_phase))*2.5)
+            use_face = self._speaking or (not self._walking and not self._being_dragged and self.expression != 'sleepy')
+            self._draw_sprite(p, x, y, self._face_frame() if use_face else self._src)
+            draw_executor_accessory(p, self, x, y, self._src)
+            p.restore()
+        elif self._transition < 1.0:
             old_pm = self._scaled.get(self._prev_expression, self._scaled["normal"])
             new_pm = self._scaled.get(self.expression, self._scaled["normal"])
             p.setOpacity(1.0 - self._transition)
@@ -1018,18 +1236,34 @@ class SpriteAnimator:
             p.setOpacity(self._transition)
             self._draw_sprite(p,x,y,new_pm)
             p.setOpacity(1.0)
+            draw_executor_accessory(p, self, x, y, new_pm)
         else:
-            self._draw_sprite(p,x,y,self._src)
+            frame = self._face_frame() if self.expression in ('normal', 'happy') else self._src
+            self._draw_sprite(p, x, y, frame)
+            draw_executor_accessory(p, self, x, y, frame)
 
         if self.sunglasses:self._draw_sunglasses(p,x,y)
-
-        # 说话动嘴：原画自带嘴部，不再叠画（避免黑线），只保留轻微点头真实感
 
         # 指点江山手臂
         if self.action == "point" and self.point_active > 0.05:
             self._draw_pointing_arm(p, x, y)
 
         p.restore()
+
+    def _draw_native_face(self, painter, x, y):
+        if self._native_face is None:
+            from ui.native_face import NativeFace
+            try:
+                self._native_face = NativeFace(self._res_dir)
+            except (FileNotFoundError, OSError):
+                self._native_face = False
+        if not self._native_face:
+            return False
+        mouth = self._mouth_pose if self._speaking else (.25 if self.expression == 'surprised' else 0.)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self._native_face.draw(painter, x, y, self._dw, self._dh, self.eye_open, mouth, self._gaze)
+        draw_executor_accessory(painter, self, x, y, self._src)
+        return True
 
     def _draw_sunglasses(self,p,x,y):
         """Vector accessory anchored to the existing character's eyes."""
@@ -1049,6 +1283,15 @@ class SpriteAnimator:
         p.restore()
 
     def _draw_sprite(self,p,x,y,pm):
+        if self._walking:
+            # Alternate the original feet; body and face remain the original artwork.
+            w,h=pm.width(),pm.height();cut=round(h*.925)
+            p.drawPixmap(x,y,pm.copy(0,0,w,cut))
+            for side in (0,1):
+                phase=self._walk_phase+side*math.pi
+                p.drawPixmap(int(x+side*w/2+math.cos(phase)*2),int(y+cut-max(0,math.sin(phase))*5),
+                    pm.copy(int(side*w/2),cut,int(w/2)+1,h-cut))
+            return
         if self.action in ('think_chin','scratch_head') and self._hand_blend>.008:
             # Keep the source face/body intact; replace only the right flipper.
             # This is a native articulated limb, not generated/interpolated art.
@@ -1062,7 +1305,7 @@ class SpriteAnimator:
             p.drawPixmap(x,y,pm);p.restore()
             self._draw_thinking_flipper(p,x,y,w,h)
             return
-        if max(abs(self.head_yaw),abs(self.head_nod),abs(self.head_tilt))<.001:
+        if self._speaking or max(abs(self.head_yaw),abs(self.head_nod),abs(self.head_tilt))<.001:
             p.drawPixmap(x,y,pm);return
         width,height=pm.width(),pm.height()
         # A sub-pixel gaze offset is invisible but the mesh path slices the
@@ -1161,17 +1404,8 @@ class SpriteAnimator:
         p.setBrush(QColor(255, 120, 60))
         p.drawPath(arrow)
 
-    def _draw_blink_eyes(self, p: QPainter, ox: int, oy: int):
-        dw, dh = self._dw, self._dh
-        for fx in (0.40, 0.60):
-            cx = ox + dw * fx
-            cy = oy + dh * 0.48
-            eye_w = dw * 0.07
-            pen = QPen(QColor(20, 20, 25), 2.0)
-            pen.setCapStyle(Qt.RoundCap)
-            p.setPen(pen)
-            p.setBrush(Qt.NoBrush)
-            path = QPainterPath()
-            path.moveTo(cx - eye_w / 2, cy)
-            path.quadTo(cx, cy + 2.2, cx + eye_w / 2, cy)
-            p.drawPath(path)
+
+# ---- [teammate-merge] legacy compat re-exports (additive) ----
+from core.legacy_compat import (  # noqa: E402,F401
+    adaptive_display_width,
+)

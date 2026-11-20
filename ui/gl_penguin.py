@@ -20,13 +20,13 @@ import math
 import os
 import sys
 
-from PyQt5.QtCore import QTimer, QPointF
-from PyQt5.QtGui import QSurfaceFormat, QOpenGLContext, QOffscreenSurface, QOpenGLFramebufferObject
+from PyQt5.QtCore import QTimer
+from PyQt5.QtGui import QSurfaceFormat, QOpenGLContext, QOffscreenSurface, QOpenGLFramebufferObject, QImage
 from PyQt5.QtWidgets import QApplication
 
 try:
     from OpenGL import GL
-    from OpenGL.GLU import gluSphere, gluNewQuadric, gluCylinder, gluDisk, gluPartialDisk
+    from OpenGL.GLU import gluSphere, gluNewQuadric, gluCylinder
     _GL_OK = True
 except Exception as e:  # noqa
     _GL_OK = False

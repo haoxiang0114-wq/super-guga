@@ -1,5 +1,5 @@
 """Application-owned tool registry; the same handlers serve typed and spoken commands."""
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import QApplication
 from core.embodiment import IDLE_GESTURES
 
@@ -19,8 +19,12 @@ class AppRuntime:
         self.dsh.tools_enabled=True
         self.dsh.archive.recover_once()
         self.dsh.event.connect(panel._dsh_event)
+        from core.codex_manager import CodexManager
+        self.codex = CodexManager(panel)
+        self.codex.update.connect(panel._codex_event)
         from core.screen_share import ScreenShareController
         self.screen_share=ScreenShareController(panel)
+        self.screen_share.failed.connect(panel._call_screen_failed)
         from core.music_performance import MusicPerformance
         self.music=MusicPerformance(panel)
         self.music.performance_event.connect(panel._music_event)
@@ -31,11 +35,18 @@ class AppRuntime:
         from core.daily_plan import DailyPlan
         self.daily_plan=DailyPlan(self.store.path.parent/'daily-plan.sqlite3')
         from core.companion_memory import CompanionMemory
-        self.companion_memory=CompanionMemory(panel.memory,self.store,self.daily_plan)
+        from core.connected_knowledge import ConnectedKnowledge
+        self.connected_knowledge = ConnectedKnowledge(self.codex.bound)
+        self.companion_memory = CompanionMemory(panel.memory, self.store, self.daily_plan,
+                                                self.connected_knowledge)
         from core.dsh_link import DshLink
         self.dsh_link=DshLink(panel)
         import threading
         self.external_desktop_lock=threading.Lock()
+        self.external_browser_cancel=threading.Event()
+        from core.wechat_file_assistant import FileAssistant
+        self.file_assistant = FileAssistant(panel, self.external_desktop_lock, self.companion_memory)
+        QTimer.singleShot(900, self.file_assistant.restore)
         self._restore_upgrade_playback()
 
     def _restore_upgrade_playback(self):
@@ -57,28 +68,124 @@ class AppRuntime:
                 QTimer.singleShot(700,restore)
         except (OSError,ValueError,TypeError):pass
 
+    def execute_internal(self, name, args):
+        """Only the application's own ToolBridge uses this entry, never IPC args."""
+        if (name=='codex_task' and args.get('action')=='start' and
+                getattr(self.panel,'_active_workflow',None) and self.panel.busy):
+            return self._handoff_workflow(args)
+        if name in ('computer', 'wechat', 'browser'):
+            if self.dsh.status().get('running') or getattr(self.panel, '_fast_inflight', False):
+                raise RuntimeError('另一项任务正在操作桌面，本次没有发送输入')
+            executor = getattr(self.panel.agent, 'computer' if name=='browser' else name, None)
+            if executor is None:raise RuntimeError('桌面智能体尚未初始化')
+            if not self.external_desktop_lock.acquire(blocking=False):
+                raise RuntimeError('已有桌面操作正在执行，请等待本次回执')
+            try:
+                if name=='browser':
+                    from core.browser_agent import execute
+                    return execute(executor,args,self.panel.agent.cancel_event)
+                return executor.execute(args, self.panel.agent.cancel_event)
+            finally:self.external_desktop_lock.release()
+        return self.execute(name, args)
+
+    def _handoff_workflow(self,args):
+        panel=self.panel
+        source=panel.active_id
+        run=(source,panel._task_started)
+        prior=getattr(self,'_workflow_handoff',None)
+        if prior and prior[0]==run:
+            return dict(ok=True,accepted=True,conversation_id=prior[1],duplicate_suppressed=True)
+        checkpoint=str(args.get('text') or '').strip()
+        if not checkpoint:raise ValueError('接力需要已执行步骤、可核对的回执和当前卡点')
+        workflow=panel._active_workflow
+        prompt=('继续咕嘎的这次工作流。先核对交接中的结果，再从未完成处接手。'
+                '已提交或结果不清的操作先查证；沿用本次任务授权的对象和范围。'
+                '\n\n用户原任务\n'+panel._active_task_text[:3200]+
+                '\n\n工作流步骤\n'+str(workflow.get('instructions') or '')[:5500]+
+                '\n\n咕嘎的实查记录和卡点\n'+checkpoint[:5400])
+        target=panel.managed.create('codex','接力 · '+str(workflow.get('title') or '工作流')[:48],
+                                   project_id=self.store.conversation(source).get('project_id'))
+        panel.managed.put(panel.managed.get(target),dispatch_parent=source)
+        self._workflow_handoff=(run,target)
+        try:
+            panel.managed.send(target,prompt)
+        except Exception:
+            self._workflow_handoff=None
+            raise
+        return dict(ok=True,accepted=True,conversation_id=target,message='已请求新建 Codex 接力对话，我会继续跟进实际结果')
+
     def execute(self, name, args):
+        if (name == 'codex_task' and
+                getattr(self.panel,'_manager_enabled',False) and self.panel.active_agent_id=='001'):
+            managed=self.panel.managed;cid=self.panel.active_id
+            action=str(args.get('action') or ('run' if name=='code_task' else 'status'))
+            if action in ('start','run','send'):
+                text=str(args.get('text') or args.get('task') or '').strip()
+                if not text or len(text)>15000:raise ValueError('任务需要 1—15000 个字符')
+                target=managed.target(cid,text,backend='codex');managed.send(target,text)
+                self.panel._managed_motion(target,'thinking',text)
+                return dict(ok=True,accepted=True,backend='codex',conversation_id=target,
+                    thread_id=managed.get(target).get('external_id',''),message='已交给当前 Codex 对话，等待真实回执')
+            if action=='stop':return managed.stop(cid)
+            if action=='status':return dict(ok=True,task=managed.get(cid),backend='codex')
+            if action=='open' and not managed.get(cid).get('external_id'):
+                managed.provision(cid);return dict(ok=True,accepted=True)
+            return self.codex.execute(args,conversation_id=cid,agent_id='001')
+        if name=='chat_control':
+            if not hasattr(self,'chat_control'):
+                from core.chat_control import ChatControl
+                self.chat_control=ChatControl(self.panel)
+            return self.chat_control.execute(args)
+        if name=='codex_task':
+            return self.codex.execute(args,conversation_id=self.panel.active_id,
+                                      agent_id=self.panel.active_agent_id)
         if name=='personal_memory':
             return self.companion_memory.execute(self.panel.active_agent_id,self.panel.active_id,args)
         if name=='dsh_link':return self.dsh_link.execute(args)
+        if name=='agent_skills':
+            from core.connected_knowledge import installed_skills
+            return dict(ok=True, skills=installed_skills(args.get('query')))
+        if name=='workflow_catalog':
+            action = args['action']
+            if action=='list':
+                return dict(ok=True,workflows=[{key: row.get(key) for key in ('id','title','trigger','state')}
+                                               for row in self.workflows.list()])
+            if action=='get':
+                ident=args.get('id')
+                for row in self.workflows.list():
+                    if row['id']==ident:
+                        return dict(ok=True,workflow=row)
+                raise ValueError('找不到该工作流')
+            if action=='define':
+                row=self.workflows.define(args.get('trigger',''),args.get('instructions',''),args.get('title',''),state='candidate')
+                return dict(ok=True,workflow=row)
+            raise ValueError('未知工作流操作')
         if name=='daily_plan':
             args=dict(args)
+            message_only=args.pop('message_only',None)
+            reminder_answer=args.pop('reminder_answer',False)
             if args.pop('open_window',False) or args.get('action')=='open':
                 self.pet._show_daily_plan()
                 args['action']='list'
             result=self.daily_plan.execute(args)
+            if message_only:result['message']=message_only
+            if reminder_answer:self.daily_plan.clear_reminder(self.panel.active_id)
             dialog=getattr(self.pet,'_daily_plan_dialog',None)
             if dialog is not None and dialog.isVisible():dialog.refresh()
             return result
-        if name in ('computer','wechat'):
+        if name in ('computer','wechat','browser'):
             import threading
             if self.panel.busy or getattr(self.panel,'_fast_inflight',False) or self.dsh.status().get('running'):
                 raise RuntimeError('咕嘎已有任务占用桌面，请等待结束或先停止；本次未发送输入')
-            executor=getattr(self.panel.agent,name,None)
+            executor=getattr(self.panel.agent,'computer' if name=='browser' else name,None)
             if executor is None:raise RuntimeError('桌面智能体尚未初始化')
             if not self.external_desktop_lock.acquire(blocking=False):
                 raise RuntimeError('已有外部桌面操作正在执行，本次未发送输入')
-            try:return executor.execute(args,threading.Event())
+            try:
+                if name=='browser':
+                    from core.browser_agent import execute
+                    return execute(executor,args,self.external_browser_cancel)
+                return executor.execute(args,threading.Event())
             finally:self.external_desktop_lock.release()
         if name=='pet_say':
             text=str(args.get('text','')).strip()
@@ -114,7 +221,6 @@ class AppRuntime:
                     items=sorted(items,key=lambda item:float(item.get('updatedAt') or 0),reverse=True)
                     slim=[]
                     for item in items[:40]:
-                        projections=item.get('projections') if isinstance(item.get('projections'),dict) else {}
                         slim.append(dict(session_id=str(item.get('sessionId') or ''),
                             running=bool(item.get('running')),cwd=str(item.get('cwd') or '')[:140],
                             title=gateway.session_title(item)[:80]))
@@ -130,6 +236,8 @@ class AppRuntime:
                         session_id=client.current_session_id()
                     if not session_id:raise ValueError('没有可读会话：请提供 session_id')
                     return dict(ok=True,**client.session_view(session_id))
+                if action=='cancel':
+                    return dict(ok=True,**client.cancel(args.get('session_id')))
                 if action=='prompt':
                     session_id=str(args.get('session_id') or '').strip()
                     text=str(args.get('text') or '').strip()
@@ -142,12 +250,14 @@ class AppRuntime:
                     session_id=str(created.get('session_id') or '')
                     if not session_id:
                         raise RuntimeError('网关没有返回新的 session_id')
-                    return dict(ok=True,session_id=session_id,created=True,**created)
+                    # created 自带 ok 键：直接展开再补 ok=True 会 TypeError（重复关键字）。
+                    return dict(created,session_id=session_id,created=True)
                 if action=='start':
                     text=str(args.get('text') or '').strip()
                     if not text:raise ValueError('start 需要 text：第一条要投递给新会话的指令')
                     created=client.start_task(text,mode=args.get('mode') or 'queue')
-                    return dict(ok=True,**created)
+                    # start_task 的返回值自带 ok（投递失败时是 False），不能再补一个 ok。
+                    return dict(created)
             except Exception as exc:
                 return dict(ok=False,error=type(exc).__name__+': '+str(exc)[:300])
             raise ValueError('未知 DSH 网关操作')
@@ -218,11 +328,18 @@ class AppRuntime:
             if action=='start':
                 if not self.panel.voice_active:
                     raise RuntimeError('共享屏幕只在长语音对话中自动启用；当前没有长语音通话')
-                self.panel._screen_share_manual_stop=False
-                return self.screen_share.start(args.get('fps'),'call')
+                if self.panel._native_video_call:
+                    if not self.panel.voice or not self.panel.voice.connected:
+                        raise RuntimeError('通话接通后可以共享屏幕')
+                    result = self.screen_share.start(2, 'call', native_video=True)
+                else:
+                    result = self.screen_share.start(args.get('fps'), 'call')
+                self.panel._screen_share_manual_stop = False
+                self.panel._set_call_share_control(True)
+                return result
             if action=='stop':
-                if self.panel.voice_active:self.panel._screen_share_manual_stop=True
-                return self.screen_share.stop()
+                self.panel.toggle_call_screen_share(False)
+                return self.screen_share.status()
             if action=='status':return self.screen_share.status()
             if action=='context':return self.screen_share.context(max(1,min(60,int(args.get('max_age',12)))))
             if action=='assist':return self.screen_share.assist_context(max(1,min(60,int(args.get('max_age',12)))))
@@ -429,6 +546,11 @@ class AppRuntime:
             return dict(runtime=dict(pid=os.getpid(),project_root=str(ROOT),voice_router_version=ROUTER_VERSION,
                                      daily_plugin_version='2026-11-10.daily-dsh.1'),
                         desktop_entry_version='2026-11-10.independent-chat-memory.4',
+                        companion_repair_version='2026-11-14.companion-closure.1',
+                        browser_bubble_version='2026-11-14.existing-browser-web-bubble.1',
+                        public_reporting=dict(getattr(getattr(self.panel,'public_reporter',None),'last_receipt',{})),
+                        result_board=dict(visible=bool(getattr(self.panel,'result_board',None) and self.panel.result_board.isVisible()),
+                            open_receipt=dict(getattr(getattr(self.panel,'result_board',None),'open_receipt',{}))),
                         models=public_settings(),
                         model_answer=dict(getattr(self.panel.answer,'last_receipt',{})),
                         desktop=dict(chat_visible=self.panel.isVisible(),chat_hwnd=int(self.panel.winId()),
@@ -443,10 +565,12 @@ class AppRuntime:
                                 opacity=self.pet.windowOpacity(), status=self.pet._status.snapshot(),
                                 volume=self.pet._tts._player.volume()),
                         current_conversation_id=self.panel.active_id,
+                        codex=dict(version='2026-11-13.codex-desktop.1',
+                                   task=self.codex.bound(self.panel.active_id)),
                         voice_active=self.panel.voice_active,
                         local_voice=dict(active=bool(self.panel.short_voice.active),
                                          mode='click_record_send',phase=self.panel.short_voice.phase,
-                                         recognition='vosk',speech='edge-tts',realtime_quota_used=False),
+                            recognition=('whisper-small' if __import__('core.local_transcription',fromlist=['available']).available() else 'vosk'),speech='edge-tts',realtime_quota_used=False),
                         voice_path=dict(owner_only=bool(self.panel.voice._cfg.get('owner_only',False)) if self.panel.voice else False,
                             speaker_gate_active=bool(self.panel.voice and self.panel.voice._speaker_gate),
                             interaction=self.panel.voice.interaction_status() if self.panel.voice else None),
@@ -455,7 +579,8 @@ class AppRuntime:
                         battleground=self.battleground.status(),
                         dsh=self.dsh.status(),dsh_link=self.dsh_link.status(),
                         screen_share=dict(self.screen_share.status(),
-                            call_expected=bool(self.panel.voice_active and not self.panel._screen_share_manual_stop),
+                            call_expected=bool(self.panel.voice_active and (self.screen_share.status().get('active')
+                                if self.panel._native_video_call else not self.panel._screen_share_manual_stop)),
                             watchdog_active=self.panel._screen_share_watchdog_timer.isActive(),
                             start_error=getattr(self.panel,'_screen_share_start_error',''),
                             voice_bridge=self.panel.voice.screen_bridge_status() if self.panel.voice else dict(attached=False),
@@ -486,11 +611,16 @@ class AppRuntime:
                             close_page='one_selected_tab_then_verify',
                             screen_share=dict(capture_fps=self.screen_share.fps,range=[2,5],max_visual_calls_per_minute=self.screen_share.max_calls_per_minute,
                                 storage='memory_only',visible_preview=False,start_policy='long_voice_call',
-                                visual_bridge='change_sampling_primary_chat_fallback',audio_model_direct_video=False),
+                                visual_bridge=('native_video' if self.panel._native_video_call else 'change_sampling_primary_chat_fallback'),
+                                audio_model_direct_video=self.panel._native_video_call),
                             isolation=dict(desktop='host',tab_worker='separate_process_7s',
                                            security_sandbox=False)),
                         music=self.music.status(),
-                        stage=dict(sunglasses=self.pet._anim.sunglasses,dancing=self.pet._anim.dancing,
+                        stage=dict(personality=self.pet.personality_status(),
+                                   executor_appearance=getattr(self.pet._anim2d,'executor_appearance','guga'),
+                                   executor_mode=self.pet._config._s.value('team/executor','self'),
+                                   speech_face='original_open_eyes',
+                                   sunglasses=self.pet._anim.sunglasses,dancing=self.pet._anim.dancing,
                                    pet_scale=getattr(self.pet,'_pet_scale',1.),
                                    floating_ui_version='2026-10-29.7',
                                    task_motion=self.pet._anim2d._task_motion.snapshot(),
@@ -517,7 +647,8 @@ class AppRuntime:
                         active_agent=dict(id=self.panel.active_agent_id,profile=self.panel.active_profile),
                         local_access=self.apps.access.status(),
                         task=self.panel.agent.task_status(),
-                        capabilities=['pet_control','pet_say','daily_plan','personal_memory', 'workspace', 'applications', 'self_ask', 'ecosystem','battleground','dsh_task','local_computer','computer','screen_share','task_plan','media_workflow','workflow_catalog','wechat_send_self','wechat','browser','web_search','music_performance'],
+                        wechat_file_assistant=self.file_assistant.status(),
+                        capabilities=['chat_control','dsh_gateway','pet_control','pet_say','daily_plan','personal_memory', 'workspace', 'applications', 'self_ask', 'ecosystem','battleground','dsh_task','codex_task','local_computer','computer','screen_share','task_plan','media_workflow','workflow_catalog','wechat_send_self','wechat','browser','web_search','music_performance'],
                         scope='本机能力由完整访问开关控制；继承咕嘎进程实际Windows权限')
         if name == 'browser':
             # 2026-11-12 修复：capabilities 里一直声明着 browser，但 execute 里没有
@@ -528,6 +659,8 @@ class AppRuntime:
             # 用户说"在浏览器里进入b站"时，模型发来的调用就是被这里挡掉的。
             import threading
             from core.browser_agent import execute as browser_execute
+            if self.panel.busy or getattr(self.panel,'_fast_inflight',False) or self.dsh.status().get('running'):
+                raise RuntimeError('咕嘎已有任务占用桌面，本次没有发送外部浏览器操作')
             executor = getattr(self.panel.agent, 'computer', None)
             if executor is None:
                 raise RuntimeError('桌面智能体尚未初始化')
@@ -557,19 +690,21 @@ class AppRuntime:
             pet._save_state()
             return dict(x=pet.x(), y=pet.y())
         if action == 'show':
-            pet.show()
+            pet.set_pet_hidden(False)
             pet._force_top()
         elif action == 'hide':
-            pet.hide()
+            pet.set_pet_hidden(True)
         elif action == 'reset_position':
             pet._reset_pos()
         elif action == 'animate':
             name = args.get('name', 'bounce')
-            if name not in ('look_up_step','bounce', 'shake', 'point', 'peek', 'tsundere','head_shake','nod','tilt','wave','sunglasses','remove_sunglasses','dance','stop_dance','sneak_peek') + IDLE_GESTURES:
+            if name not in ('entrance','poke','work','walk','look_up_step','bounce', 'shake', 'point', 'peek', 'tsundere','head_shake','nod','tilt','wave','sunglasses','remove_sunglasses','dance','stop_dance','sneak_peek') + IDLE_GESTURES:
                 raise ValueError('未知动画')
             if str(getattr(self.panel,'active_agent_id','001'))!='001' and hasattr(pet,'_multi_agent'):
                 pet._multi_agent.gesture(self.panel.active_agent_id,name)
-            else:pet._perform_gesture(name)
+            else:
+                applied=pet._perform_gesture(name)
+                if applied is False:return dict(ok=False,action=action,error='当前状态或屏幕空间不适合播放')
         elif action == 'set_expression':
             name = args.get('name')
             allowed=('normal','happy','sleepy','surprised','sad','playful')
@@ -617,6 +752,8 @@ class AppRuntime:
             pet._open_agent_chat()
         elif action == 'open_desktop_console':
             pet._open_desktop_console()
+        elif action == 'open_behavior_settings':
+            pet._show_behavior_dialog()
         elif action == 'open_voice_settings':
             # Deferred to avoid blocking the queued tool callback in a modal dialog.
             from PyQt5.QtCore import QTimer
@@ -641,7 +778,12 @@ class AppRuntime:
                 raise ValueError('更名项目需要明确的项目 ID')
             self.store.rename('project', ident, args['name'])
         elif action == 'new_conversation':
-            result['conversation_id'] = self.store.create_conversation(args.get('name', '新对话'), args.get('project_id') or None,agent_id=self.panel.active_agent_id)
+            if getattr(self.panel,'_manager_enabled',False):
+                from core.managed_chat import default_backend
+                result['conversation_id']=self.panel.managed.create(default_backend(self.panel.active_agent_id),
+                    args.get('name','新对话'),args.get('project_id') or None,agent_id=self.panel.active_agent_id)
+            else:
+                result['conversation_id'] = self.store.create_conversation(args.get('name', '新对话'), args.get('project_id') or None,agent_id=self.panel.active_agent_id)
             # Keep this running turn bound to its original conversation.
         elif action == 'rename_conversation':
             self.store.rename('conversation', ident, args['name'])

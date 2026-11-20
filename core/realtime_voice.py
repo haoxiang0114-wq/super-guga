@@ -16,7 +16,7 @@ import struct
 import sys
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -49,7 +49,14 @@ def voice_event(kind, **fields):
         pass
 
 
-DEFAULTS = dict(provider='qianwen', model='qwen-audio-3.1-realtime-plus', region='cn-beijing',
+SEED_PROVIDER = 'volcengine'
+SEED_URL = 'wss://openspeech.bytedance.com/api/v3/realtime'
+SEED_MODEL = '1.3.0.0'
+SEED_VOICE = 'zh_female_vv_jupiter_bigtts'
+PROVIDER_NAMES = {'qianwen': '千问 AI 平台', 'bailian': '阿里云百炼',
+                  SEED_PROVIDER: '火山引擎 Seed Realtime', 'custom': '自定义实时语音'}
+
+DEFAULTS = dict(ws_url='', provider='qianwen', model='qwen-audio-3.1-realtime-plus', region='cn-beijing',
                 workspace_id='', api_key='', voice='longanqian_v3.1', headphones=False,
                 silence_duration_ms=600, turn_mode='server_vad', max_call_minutes=0,
                 idle_minutes=30, input_device=None, output_device=None,
@@ -99,21 +106,49 @@ def load_settings():
     try:idle=int(settings.get('idle_minutes') or 0)
     except (TypeError,ValueError):idle=0
     settings['idle_minutes']=30 if idle<=0 else max(5,min(30,idle))
-    settings['api_key'] = settings.get('api_key') or os.getenv('DASHSCOPE_API_KEY', '')
-    settings['workspace_id'] = settings.get('workspace_id') or os.getenv('DASHSCOPE_WORKSPACE_ID', '')
+    return with_environment_credentials(settings)
+
+
+def with_environment_credentials(settings):
+    settings = dict(settings)
+    provider = settings.get('provider', 'qianwen')
+    env_name = {SEED_PROVIDER: 'VOLCENGINE_SPEECH_API_KEY', 'custom': 'GUGA_REALTIME_API_KEY'}.get(
+        provider, 'DASHSCOPE_API_KEY')
+    settings['api_key'] = settings.get('api_key') or os.getenv(env_name, '')
+    if provider == 'bailian':
+        settings['workspace_id'] = settings.get('workspace_id') or os.getenv('DASHSCOPE_WORKSPACE_ID', '')
     return settings
+
+
+def connection_headers(cfg):
+    key = cfg['api_key'].strip()
+    if cfg.get('provider') == SEED_PROVIDER:
+        return ['X-Api-Key: ' + key]
+    return ['Authorization: Bearer ' + key]
 
 
 def connection_url(cfg):
     provider = cfg.get('provider', 'qianwen')
-    if provider not in ('qianwen', 'bailian'):
-        raise ValueError('请选择千问 AI 平台或阿里云百炼')
-    model = cfg.get('model', '')
+    if provider not in PROVIDER_NAMES:
+        raise ValueError('请选择受支持的实时语音平台')
+    if not cfg.get('api_key', '').strip():
+        raise ValueError('请填写所选平台的 API Key')
+    model = cfg.get('model', '').strip()
+    if provider == SEED_PROVIDER:
+        if model != SEED_MODEL:
+            raise ValueError('Seed Realtime 模型版本应填写 ' + SEED_MODEL)
+        return SEED_URL
+    if provider == 'custom':
+        endpoint = urlsplit(cfg.get('ws_url', '').strip())
+        if endpoint.scheme != 'wss' or not endpoint.hostname or endpoint.username or endpoint.fragment:
+            raise ValueError('请填写有效的 wss:// 实时语音地址')
+        if not model:
+            raise ValueError('请填写自定义实时语音模型名称')
+        query = [(k, v) for k, v in parse_qsl(endpoint.query, keep_blank_values=True) if k != 'model']
+        return urlunsplit(endpoint._replace(query=urlencode(query + [('model', model)])))
     if model not in ('qwen-audio-3.1-realtime-plus', 'qwen3.8-omni-flash-realtime', 'qwen3.5-omni-plus-realtime',
                      'qwen3.5-omni-flash-realtime'):
         raise ValueError('不支持此实时模型，请从配置列表选择')
-    if not cfg.get('api_key', '').strip():
-        raise ValueError('请填写所选平台的 API Key')
     if provider == 'qianwen':
         return 'wss://maas.qianwenaiapi.com/api-ws/v1/realtime?' + urlencode({'model': model})
     workspace = cfg.get('workspace_id', '').strip()
@@ -237,7 +272,7 @@ class ManualInputCapture:
         if self.owner._manual_capture_hold.is_set():
             self.close();self.owner._manual_capture_released.set()
         elif self.stream is None:
-            stream=self.audio.RawInputStream(samplerate=16000,channels=1,dtype='int16',blocksize=640,
+            stream=self.audio.RawInputStream(samplerate=16000,channels=1,dtype='int16',blocksize=self.owner.input_blocksize,
                 device=self.owner._cfg.get('input_device'),callback=self.owner._capture)
             stream.__enter__();self.stream=stream;self.owner._manual_capture_released.clear()
     def close(self):
@@ -248,6 +283,7 @@ class ManualInputCapture:
 
 
 class RealtimeVoice(QObject):
+    input_blocksize = 640
     status = pyqtSignal(str)
     transcript = pyqtSignal(str, str)
     speaking = pyqtSignal(bool)
@@ -302,6 +338,7 @@ class RealtimeVoice(QObject):
         self._connection_seq=0
         self._last_ping=0.0
         self._last_audio_at=0.0
+        self.mouth_level = 0.
         self._echo_processor=None;self._echo_stats={};self._echo_error=''
         self._input_turns=0;self._output_turns=0;self._interruptions=0
         self._last_playback_warning=0.0
@@ -383,7 +420,7 @@ class RealtimeVoice(QObject):
             self._speaker_gate.close()
         self._speaker_gate = None
         ws = self._ws
-        if ws:
+        if ws and self._cfg.get('provider') != SEED_PROVIDER:
             # shutdown wakes recv without a close-handshake wait.
             try:
                 ws.shutdown()
@@ -431,7 +468,7 @@ class RealtimeVoice(QObject):
     def _send(self, event):
         with self._send_lock:
             if self._ws:
-                if isinstance(event,dict) and event.get('type') not in ('input_audio_buffer.append',):
+                if isinstance(event,dict) and event.get('type') not in ('input_audio_buffer.append', 'input_image_buffer.append'):
                     voice_event('send', event=str(event.get('type',''))[:40])
                 self._ws.send(json.dumps(event, ensure_ascii=False,separators=(',',':')))
 
@@ -526,6 +563,9 @@ class RealtimeVoice(QObject):
         with self._state_lock:
             data, has_audio = self._pcm.read(len(outdata))
             outdata[:] = data
+            # Use speaker samples, separately from the microphone level meter.
+            pcm = memoryview(data).cast('h')[::8] if has_audio else ()
+            self.mouth_level = min(1., sum(map(abs, pcm)) / (len(pcm) * 3000.)) if pcm else 0.
             if has_audio:
                 self._echo_until = time.monotonic() + 0.35
                 self._last_audio_at = time.monotonic()
@@ -756,30 +796,40 @@ class RealtimeVoice(QObject):
     def _connection(self):
         import sounddevice as sd
         import websocket
-        platform = '千问 AI 平台' if self._cfg.get('provider', 'qianwen') == 'qianwen' else '阿里云百炼'
+        platform = PROVIDER_NAMES[self._cfg.get('provider', 'qianwen')]
         self.status.emit('正在连接' + platform + '…')
         ws = websocket.create_connection(connection_url(self._cfg),
-                                         header=['Authorization: Bearer ' + self._cfg['api_key'].strip()], timeout=12)
+                                         header=connection_headers(self._cfg), timeout=12)
         self._ws = ws
         self._connection_seq+=1
         phase='handshake';opened=time.monotonic();self._last_disconnect_reason=''
         try:
             if self._stop.is_set():
                 return
+            seed = self._cfg.get('provider') == SEED_PROVIDER
+            if seed:
+                ws.settimeout(1)
+                self._send(self._seed_create_event())
             deadline = time.monotonic() + 20
             configured = False
             while time.monotonic() < deadline and not self._stop.is_set():
-                raw = self._recv_message(ws)
+                try:
+                    raw = self._recv_message(ws)
+                except websocket.WebSocketTimeoutException:
+                    if seed:
+                        continue
+                    raise
                 if raw is None:continue
                 if not raw:raise RecoverableVoiceError('连接已关闭，正在续接')
                 event = json.loads(raw)
-                if event.get('type') == 'session.created':
+                kind = event.get('type')
+                if kind == 'session.created' and not seed:
                     self._send(dict(type='session.update', session=self._session_settings()))
-                elif event.get('type') == 'session.updated':
+                elif kind == ('session.created' if seed else 'session.updated'):
                     self._handle_event(event)
                     configured = True
                     break
-                elif event.get('type') == 'error' or (not event.get('type') and event.get('code')):
+                elif kind == 'error' or (not kind and (event.get('code') or event.get('status_code'))):
                     self._handle_event(event)
             if not configured:
                 if self._stop.is_set():
@@ -837,6 +887,8 @@ class RealtimeVoice(QObject):
                                 if phase=='send':raise
                                 continue
                     finally:
+                        if seed and self._stop.is_set():
+                            self._close_seed_session(ws)
                         ws.shutdown()
         except Exception as exc:
             if not self._stop.is_set():
@@ -885,6 +937,9 @@ class RealtimeVoice(QObject):
                 except websocket.WebSocketBadStatusException as exc:
                     if exc.status_code in (400, 401, 403, 404, 429):
                         self.last_error = f'语音平台连接失败 HTTP {exc.status_code}，请检查所选平台的 Key、模型权限和额度'
+                        if self._cfg.get('provider') == SEED_PROVIDER and exc.status_code in (401, 403):
+                            self.last_error = (f'火山实时语音鉴权失败 HTTP {exc.status_code}。'
+                                               '请填写豆包语音控制台的 API Key，并核对实时音视频通话试用权限')
                         voice_event('fatal_http', status=exc.status_code)
                         self.failed.emit(self.last_error)
                         break

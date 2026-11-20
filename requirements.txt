@@ -19,6 +19,7 @@ numpy>=1.20
 onnxruntime>=1.20
 kaldi-native-fbank>=1.22.4
 playwright>=1.49
+PyYAML>=6.0
 markdown-it-py>=3.0
 pygments>=2.15
 # core/adapters/guga_mcp_server.py 在模块级导入 mcp.server.fastmcp，

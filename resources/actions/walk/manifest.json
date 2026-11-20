@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "clips": [
+    {
+      "name": "walk_left",
+      "frames": "walk_left/frames",
+      "native_fps": 24.0,
+      "reference_width": 245,
+      "canvas": [
+        320,
+        416
+      ],
+      "baseline": 408
+    },
+    {
+      "name": "walk_right",
+      "frames": "walk_right/frames",
+      "native_fps": 24.0,
+      "reference_width": 245,
+      "canvas": [
+        320,
+        416
+      ],
+      "baseline": 408
+    }
+  ]
+}

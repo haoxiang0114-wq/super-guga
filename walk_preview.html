@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>桌宠走路动画 · 成果展示</title>
+<style>
+  :root{
+    --bg:#12141a; --panel:#1b1e26; --panel2:#22262f; --line:#2e333f;
+    --txt:#e8ecf3; --dim:#9aa3b2; --accent:#ff7a45; --accent2:#4ec9b0; --blue:#5b9dff;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:radial-gradient(1200px 600px at 50% -10%,#20242e 0%,var(--bg) 55%);
+    color:var(--txt); font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+    padding:28px 22px 44px; min-height:100vh;
+  }
+  .wrap{max-width:1180px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px;letter-spacing:.5px}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:22px;line-height:1.7}
+  .sub code{background:#000;padding:1px 5px;border-radius:4px;color:var(--accent2);font-size:12px}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+  .card-head{display:flex;align-items:center;justify-content:space-between;padding:12px 15px;border-bottom:1px solid var(--line)}
+  .card-title{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent2);box-shadow:0 0 8px var(--accent2)}
+  .meta{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+
+  /* 舞台：320x416 画布放大 1.35 */
+  .stage{
+    position:relative;height:392px;display:flex;align-items:flex-end;justify-content:center;
+    background:
+      radial-gradient(320px 120px at 50% 100%,rgba(255,122,69,.10),transparent 70%),
+      repeating-linear-gradient(90deg,rgba(255,255,255,.028) 0 1px,transparent 1px 34px),
+      linear-gradient(#191c24,#15171e);
+    overflow:hidden;
+  }
+  .stage img{width:216px;height:281px;image-rendering:auto;filter:drop-shadow(0 8px 14px rgba(0,0,0,.5))}
+  /* baseline 408/416 ≈ 98% 处的地面线 */
+  .floor{position:absolute;left:0;right:0;bottom:14px;height:1px;background:linear-gradient(90deg,transparent,rgba(255,122,69,.55),transparent)}
+  .floor::after{content:"baseline 408";position:absolute;right:10px;top:-15px;font-size:10px;color:rgba(255,122,69,.65)}
+  .badge{position:absolute;left:12px;top:10px;font-size:10px;letter-spacing:1px;color:var(--dim);
+         border:1px solid var(--line);background:rgba(0,0,0,.35);padding:3px 7px;border-radius:20px}
+
+  .bar{display:flex;align-items:center;gap:10px;padding:11px 15px;border-top:1px solid var(--line);background:var(--panel2)}
+  .bar button{
+    border:1px solid var(--line);background:#2a2f3a;color:var(--txt);font-size:12px;
+    padding:5px 11px;border-radius:7px;cursor:pointer;transition:.15s;
+  }
+  .bar button:hover{background:#343a47;border-color:#414855}
+  .bar button.on{background:var(--accent);border-color:var(--accent);color:#1a1207;font-weight:600}
+  .slider{flex:1;display:flex;align-items:center;gap:8px;font-size:11px;color:var(--dim)}
+  input[type=range]{flex:1;accent-color:var(--accent);height:3px}
+
+  /* 指标区 */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:20px}
+  @media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
+  .stat .k{font-size:11px;color:var(--dim);margin-bottom:5px}
+  .stat .v{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums}
+  .stat .v small{font-size:11px;color:var(--dim);font-weight:400;margin-left:3px}
+  .ok{color:var(--accent2)}
+
+  .sect{margin-top:26px}
+  .sect h2{font-size:14px;margin:0 0 12px;color:var(--txt);font-weight:600}
+  .sect h2 em{font-style:normal;color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
+
+  .flow{display:flex;align-items:stretch;gap:0;flex-wrap:wrap}
+  .step{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:12px 14px;margin-right:26px;position:relative}
+  .step:last-child{margin-right:0}
+  .step:not(:last-child)::after{content:"→";position:absolute;right:-20px;top:50%;transform:translateY(-50%);color:#4a5162;font-size:15px}
+  .step .n{font-size:10px;color:var(--accent);letter-spacing:1.5px;margin-bottom:6px}
+  .step .t{font-size:13px;font-weight:600;margin-bottom:5px}
+  .step .d{font-size:11.5px;color:var(--dim);line-height:1.65}
+  .step code{color:var(--accent2);font-size:11px;background:#000;padding:1px 4px;border-radius:3px}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  th,td{text-align:left;padding:9px 14px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:11px;letter-spacing:.5px;background:var(--panel2)}
+  tr:last-child td{border-bottom:none}
+  td code{color:var(--accent2);font-size:11.5px;background:#000;padding:1px 5px;border-radius:4px}
+  .say{color:var(--blue)}
+
+  .foot{margin-top:24px;font-size:11.5px;color:#6d7586;line-height:1.8;text-align:center}
+  .shot{display:flex;align-items:center;justify-content:center;padding:10px 0 14px;
+        background:repeating-conic-gradient(#20232b 0% 25%,#1a1d24 0% 50%) 50%/18px 18px}
+  .shot img{width:150px;display:block;image-rendering:auto;filter:drop-shadow(0 6px 12px rgba(0,0,0,.45))}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>桌宠走路动画 <span>·</span> 已接入语音动作</h1>
+  <div class="sub">
+    素材来自 D 盘表情包视频的行走片段，抠背景、统一缩放与基线后切成循环帧。
+    说一句话就能让桌宠在屏幕上左右走 —— 下面是真实帧序列的逐帧回放（原生 <code>24 fps</code>，画布 <code>320×416</code>，基线 <code>408</code>）。
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title"><span class="dot"></span>向左走 · walk_left</div>
+        <div class="meta" id="metaL">22 帧 · 24 fps</div>
+      </div>
+      <div class="stage">
+        <div class="badge">WALK LEFT</div>
+        <img id="imgL" alt="walk left">
+        <div class="floor"></div>
+      </div>
+      <div class="bar">
+        <button class="on" data-play="L">暂停</button>
+        <button data-step="L">下一帧</button>
+        <div class="slider">
+          <span>速度</span>
+          <input type="range" id="spdL" min="0.4" max="2" step="0.1" value="1">
+          <span id="spdLv">1.0×</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title"><span class="dot" style="background:var(--blue);box-shadow:0 0 8px var(--blue)"></span>向右走 · walk_right</div>
+        <div class="meta" id="metaR">24 帧 · 24 fps</div>
+      </div>
+      <div class="stage">
+        <div class="badge">WALK RIGHT</div>
+        <img id="imgR" alt="walk right">
+        <div class="floor"></div>
+      </div>
+      <div class="bar">
+        <button class="on" data-play="R">暂停</button>
+        <button data-step="R">下一帧</button>
+        <div class="slider">
+          <span>速度</span>
+          <input type="range" id="spdR" min="0.4" max="2" step="0.1" value="1">
+          <span id="spdRv">1.0×</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="k">帧数 / 帧率</div><div class="v">22 · 24 <small>左</small> / 24 · 24 <small>右</small></div></div>
+    <div class="stat"><div class="k">循环缝差（越低越顺）</div><div class="v ok">4.31 / 7.26</div></div>
+    <div class="stat"><div class="k">帧间变化中位 / 峰值</div><div class="v">14.2 / 31.4 <small>Δ</small></div></div>
+    <div class="stat"><div class="k">画布 / 基线</div><div class="v">320×416 <small>· 408</small></div></div>
+  </div>
+
+  <div class="sect">
+    <h2>从一句话到屏幕上走路<em>四个环节全部打通并实测</em></h2>
+    <div class="flow">
+      <div class="step">
+        <div class="n">01 语音文本</div>
+        <div class="t">听清方向</div>
+        <div class="d">正则识别"向左走 / 往右走 / 走过去 / 停下"等 <code>11</code> 类说法，避免"向右看看"之类误命中。</div>
+      </div>
+      <div class="step">
+        <div class="n">02 意图分发</div>
+        <div class="t">走快通道</div>
+        <div class="d">直接命中本地快指令，不经过大模型，<code>0</code> 延迟出动作；非走路语句照常走对话。</div>
+      </div>
+      <div class="step">
+        <div class="n">03 窗口位移</div>
+        <div class="t">真的在走</div>
+        <div class="d">定时器按 60 tick 推进窗口 X 坐标，同时播放 <code>walk:</code> 前缀帧序列，碰屏幕边缘自动停。</div>
+      </div>
+      <div class="step">
+        <div class="n">04 状态收口</div>
+        <div class="t">走完归位</div>
+        <div class="d">松手拖拽 / 说"停下" / 退出程序都会立即 <code>stop_walk()</code>，回到待机动画，不留残影。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sect">
+    <h2>语音说法 → 实际动作<em>解析结果来自真实函数</em></h2>
+    <table>
+      <tr><th style="width:44%">你说的话</th><th style="width:20%">识别动作</th><th>桌宠实际行为</th></tr>
+      <tr><td class="say">"向左走" / "往左走一点" / "往左边走过去"</td><td><code>left</code></td><td>切换左走帧，窗口向左平移，直到说停或碰到屏幕左边缘</td></tr>
+      <tr><td class="say">"向右走" / "往右走" / "把窗口往右挪过去"</td><td><code>right</code></td><td>切换右走帧，窗口向右平移</td></tr>
+      <tr><td class="say">"随便走走" / "走两步"</td><td><code>walk</code></td><td>自动挑一个方向走一小段，再自己停下</td></tr>
+      <tr><td class="say">"停下" / "别走了" / "站住"</td><td><code>stop</code></td><td>立刻停在原地，恢复待机呼吸动画</td></tr>
+      <tr><td class="say">"向右看看" <span style="color:#6d7586">（不该触发）</span></td><td><span style="color:#6d7586">不匹配</span></td><td>交给对话处理，不会误走</td></tr>
+    </table>
+  </div>
+
+  <div class="sect">
+    <h2>实机跑一遍的轨迹<em>真实 PetWindow，真实动画器，坐标逐点记录</em></h2>
+    <table>
+      <tr><th style="width:26%">我做的事</th><th style="width:14%">起始 x</th><th style="width:14%">结束 x</th><th style="width:18%">播的片段</th><th>结果</th></tr>
+      <tr><td class="say">说"向左走"</td><td>120</td><td>24</td><td><code>walk:left</code></td><td>向左移动，走到屏幕左边贴边自动停（留 24px）</td></tr>
+      <tr><td class="say">说"向右走"</td><td>24</td><td>414</td><td><code>walk:right</code></td><td>向右走满 390px，走完自己收脚</td></tr>
+      <tr><td class="say">走 0.4 秒后说"停下"</td><td>414</td><td>365</td><td>→ 待机</td><td>只走了 49px 就刹住，之后 1.3 秒位置一动不动</td></tr>
+      <tr><td class="say">贴着左边再给 4 秒</td><td>260</td><td>24</td><td><code>walk:left</code></td><td>距离被自动砍到 236px，撞边即停，不会走出屏幕</td></tr>
+    </table>
+  </div>
+
+  <div class="sect">
+    <h2>实机抓图<em>窗口整体渲染，不是单独截帧</em></h2>
+    <div class="grid">
+      <div class="card">
+        <div class="card-head"><div class="card-title">左走中 · 整窗画面</div><div class="meta">x = 52</div></div>
+        <div class="shot"><img src="data/_walk_raw/live_left.png" alt="live left"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title">右走中 · 整窗画面</div><div class="meta">x = 93</div></div>
+        <div class="shot"><img src="data/_walk_raw/live_right.png" alt="live right"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    渲染自 <code style="background:#000;padding:1px 5px;border-radius:4px;color:#4ec9b0">resources/actions/walk/</code> 下的原始帧文件 ·
+    上图为逐帧切换，与实际桌宠播放同一套素材
+  </div>
+</div>
+
+<script>
+(function(){
+  var clips = {
+    L:{n:22, el:document.getElementById('imgL'), idx:0, playing:true, speed:1},
+    R:{n:24, el:document.getElementById('imgR'), idx:0, playing:true, speed:1}
+  };
+  var base = 'resources/actions/walk/';
+  var dir = {L:'walk_left/frames/', R:'walk_right/frames/'};
+  var cache = {L:[],R:[]};
+
+  function pad(i){ return String(i).length<3 ? ('00'+i).slice(-3) : String(i); }
+  function url(k,i){ return base + dir[k] + pad(i) + '.png'; }
+
+  // 预加载，避免切帧闪烁
+  Object.keys(clips).forEach(function(k){
+    for(var i=0;i<clips[k].n;i++){
+      var im = new Image();
+      im.src = url(k,i);
+      cache[k].push(im);
+    }
+    clips[k].el.src = url(k,0);
+  });
+
+  function tick(k){
+    var c = clips[k];
+    if(!c.playing) return;
+    c.idx = (c.idx + 1) % c.n;
+    c.el.src = cache[k][c.idx].src;
+  }
+
+  // 每个方向一个 24fps 的基准定时器，用步进节流实现变速
+  setInterval(function(){
+    Object.keys(clips).forEach(function(k){
+      var c = clips[k];
+      if(!c.playing) return;
+      c._acc = (c._acc||0) + c.speed;
+      if(c._acc >= 1){ c._acc -= 1; tick(k); }
+    });
+  }, 1000/24);
+
+  document.querySelectorAll('[data-play]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var k = btn.dataset.play, c = clips[k];
+      c.playing = !c.playing;
+      btn.textContent = c.playing ? '暂停' : '播放';
+      btn.classList.toggle('on', c.playing);
+    });
+  });
+
+  document.querySelectorAll('[data-step]').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var k = btn.dataset.step, c = clips[k];
+      c.playing = false;
+      var pb = document.querySelector('[data-play="'+k+'"]');
+      pb.textContent='播放'; pb.classList.remove('on');
+      c.idx = (c.idx + 1) % c.n;
+      c.el.src = cache[k][c.idx].src;
+    });
+  });
+
+  ['L','R'].forEach(function(k){
+    var s = document.getElementById('spd'+k), v = document.getElementById('spd'+k+'v');
+    s.addEventListener('input', function(){
+      clips[k].speed = parseFloat(s.value);
+      v.textContent = parseFloat(s.value).toFixed(1)+'×';
+    });
+  });
+})();
+</script>
+</body>
+</html>

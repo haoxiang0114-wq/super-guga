@@ -216,6 +216,9 @@ class SpriteAnimator:
         # natural idle playback. Keep that scope separate from task-video policy.
         self._idle_motion_enabled=True
         self._load_idle_clips()
+        # 走路片段不进待机随机链：它只由「向左走 / 向右走」明确触发，
+        # 出现在待机里会变成原地踏步。
+        self._load_walk_clips()
         self._load_personality_clips()
         from ui.pet_effects import PetEffects
         self.effects = PetEffects()
@@ -403,13 +406,17 @@ class SpriteAnimator:
         base=Path(base)
         try:
             manifest=json.loads((base/'manifest.json').read_text(encoding='utf-8'))
+            loaded_names=[]
             for spec in manifest.get('clips',[]):
                 name=str(spec.get('name','')).strip();folder=(base/spec['frames']).resolve();fps=float(spec['native_fps'])
                 if not name or not folder.is_relative_to(base.resolve()) or not 20<=fps<=60:continue
                 if 'idle:' + name in self.clips:continue
-                clip='idle:'+name;self._load_action_frames(clip,str(folder),fps,lazy=True,
+                clip="idle:"+name;self._load_action_frames(clip,str(folder),fps,lazy=True,
                     reference_width=spec.get('reference_width'), placement=spec.get('placement'))
-                if clip in self.clips:self.idle_motion_clips.append((name,max(.01,float(spec.get('weight',1)))))
+                if clip in self.clips:
+                    self.idle_motion_clips.append((name,max(.01,float(spec.get('weight',1)))))
+                    loaded_names.append(name)
+            if base.name=='resident-motion-v2':self._resident_clip_names=loaded_names
             if manifest.get('padded_canvas'):
                 # 以前是"少于 4 个片段就整组丢弃、退回 idle-motion（245×352、无扩边、按适配盒缩放）"，
                 # 于是通过审核的高质量素材一个都没用上，看起来就跟静态立绘不是同一图层。
@@ -422,6 +429,77 @@ class SpriteAnimator:
                 self.height=self._dh+self._resident_pad[1]+round(self._dw*12/245)
                 self._load_idle_clips(Path(self._res_dir)/'actions/idle-motion')
         except (OSError,ValueError,TypeError,KeyError):return
+
+    def reload_idle_clips(self):
+        """表情工坊导入后热重载待机链：只清掉清单里登记过的片段，不碰其它动作。"""
+        for name in getattr(self,'_resident_clip_names',[]) or []:
+            self.clips.pop('idle:'+name,None)
+        self.idle_motion_clips=[]
+        self._load_idle_clips()
+        return [name for name,_weight in self.idle_motion_clips]
+
+    # ==================== 走路 ====================
+
+    WALK_PREFIX = 'walk:'
+
+    def _load_walk_clips(self):
+        """左右走片段。只按方向明确播放，不进待机随机链。"""
+        import json
+        from pathlib import Path
+        base = Path(self._res_dir) / 'actions' / 'walk'
+        try:
+            manifest = json.loads((base / 'manifest.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            return {}
+        loaded = {}
+        for spec in manifest.get('clips', []):
+            name = str(spec.get('name', '')).strip()
+            # manifest 里记的是目录名（walk_left / walk_right），方向是它的后缀
+            direction = name[5:] if name.startswith('walk_') else name
+            folder = (base / spec['frames']).resolve()
+            fps = float(spec.get('native_fps', 24.0))
+            if direction not in ('left', 'right') or not folder.is_relative_to(base.resolve()):
+                continue
+            if not 20 <= fps <= 60:
+                continue
+            clip = self.WALK_PREFIX + direction
+            try:
+                # reference_width 与待机片段同口径（245），切换时角色大小不跳
+                self._load_action_frames(clip, str(folder), fps, lazy=True,
+                                         reference_width=spec.get('reference_width', 245))
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            if clip in self.clips:
+                self.clips[clip]['loop'] = True
+                loaded[direction] = len(self.clips[clip]['frames'])
+        self._walk_clips = loaded
+        return loaded
+
+    @property
+    def walk_clips(self):
+        return dict(getattr(self, '_walk_clips', {}) or {})
+
+    def play_walk(self, direction):
+        """开始按方向走路循环；没有该方向的素材就返回 False（调用方决定要不要硬走）。"""
+        clip = self.WALK_PREFIX + str(direction)
+        if clip not in self.clips:
+            return False
+        self.action = 'none'
+        self.dancing = False
+        self._idle_rest = None
+        if self._clip != clip:
+            self.play_clip(clip, loop=True)
+        return self._clip == clip
+
+    def stop_walk(self):
+        if (self._clip or '').startswith(self.WALK_PREFIX):
+            self.stop_clip()
+            return True
+        return False
+
+    @property
+    def walking(self):
+        return (self._clip or '').startswith(self.WALK_PREFIX)
 
     def _tick_task_motion(self):
         blocked=(self.expression=='sleepy' or self._context_expression not in (None,'happy') or
@@ -1157,7 +1235,7 @@ class SpriteAnimator:
 
         self._draw_shadow(p, x, y)
 
-        native = (self._clip or '').startswith(('idle:', 'personality:', 'task:'))
+        native = (self._clip or '').startswith(('idle:', 'personality:', 'task:', 'walk:'))
         settled = (self._idle_rest is not None and self.expression in ('normal', 'happy')
                    and self.action == 'none' and not self._speaking and not self._task_motion.active)
         fading = self._xfade_pm is not None and self._xfade_t < 1.0

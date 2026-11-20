@@ -127,10 +127,11 @@ class SelectionActionTests(unittest.TestCase):
         self.assertIn(text,p);self.assertIn('不解答或执行',p);self.assertIn('待补充',p)
         self.assertIn('完成标准',p)
 
-    def test_toolbar_has_four_actions_and_retains_cached_payload(self):
+    def test_toolbar_has_five_actions_and_retains_cached_payload(self):
         bar=SelectionBar();got=[];bar.chosen.connect(lambda action,value:got.append((action,value)))
         labels=[b.text() for b in bar.findChildren(QPushButton)]
-        self.assertEqual(labels[:4],['截图提问','解释','翻译','优化提示词'])
+        # 查词放在第一位：PyMaster 学习场景最常用，其它动作顺序不动
+        self.assertEqual(labels[:5],['查词','截图提问','解释','翻译','优化提示词'])
         bar.payload={'text':'hello','context':'world'};bar.pick('translate')
         self.assertEqual(got,[('translate',{'text':'hello','context':'world'})]);bar.close()
 

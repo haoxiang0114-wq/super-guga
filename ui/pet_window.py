@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """咕嘎企鹅桌宠主窗口 — 透明悬浮（企鹅精灵图动画 + 视觉 + 语音）"""
-import ctypes, os, sys, logging, random, math, threading
+import ctypes, os, sys, logging, random, math, threading, time
 
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(__file__), '..', 'pet_debug.log'),
@@ -13,7 +13,8 @@ from PyQt5.QtGui import (
     QFontMetrics, QPen, QPainterPath, QRadialGradient
 )
 from PyQt5.QtWidgets import (
-    QWidget, QMenu, QSystemTrayIcon, QApplication, QFrame, QPlainTextEdit, QHBoxLayout, QLabel
+    QWidget, QMenu, QSystemTrayIcon, QApplication, QFrame, QPlainTextEdit, QHBoxLayout, QLabel,
+    QToolTip
 )
 
 from ui.bongo_panel import BongoPanel
@@ -761,6 +762,9 @@ class PetWindow(QWidget):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
+            # 用户上手抓它，正在走的动作立刻收掉，不然会拖着走路动画一起跑
+            if self._pet_physics.mode == 'walk':
+                self.stop_walk()
             self._on_user_interaction()
             self._long_press_fired = False
             if self._voice_mode:
@@ -975,6 +979,7 @@ class PetWindow(QWidget):
         menu.addAction("🧩 插件市场").triggered.connect(self._open_plugin_market)
         settings = menu.addMenu("🖥️ 桌面管理台")
         settings.addAction("模型与语音设置…").triggered.connect(self._open_desktop_console)
+        settings.addAction("📚 学习助手（PyMaster）…").triggered.connect(lambda:self._open_desktop_console("学习助手"))
         settings.addAction("💭 陪伴与碎碎念…").triggered.connect(self._show_companion_settings)
         voice = menu.addMenu("🎙️ 语音与说话")
         voice.addAction("🎙 点击说话 · 录音后发送").triggered.connect(self._open_voice_recording)
@@ -1021,6 +1026,7 @@ class PetWindow(QWidget):
         tools = menu.addMenu("🔧 工具")
         tools.addAction("📷 截图提问").triggered.connect(lambda:self._screen_tools.begin('region_ask'))
         tools.addAction("🔍 解释").triggered.connect(lambda:self._screen_tools.begin('explain'))
+        tools.addAction("📚 打开 PyMaster 学习助手").triggered.connect(self._open_pymaster)
         selection = tools.addAction('全局划词工具条')
         selection.setCheckable(True);selection.setChecked(self._screen_tools.selection_enabled)
         selection.toggled.connect(self._screen_tools.set_selection_enabled)
@@ -1209,9 +1215,10 @@ class PetWindow(QWidget):
         self._agent_panel.raise_()
         self._agent_panel.activateWindow()
 
-    def _open_desktop_console(self):
+    def _open_desktop_console(self,tab=None):
         from ui.desktop_console import DesktopConsole
         if getattr(self,'_desktop_console',None) is None:self._desktop_console=DesktopConsole(self)
+        if tab is not None:self._desktop_console.select_tab(tab)
         self._desktop_console.show();self._desktop_console.raise_();self._desktop_console.activateWindow()
 
     def _open_model_connection(self):
@@ -1432,6 +1439,28 @@ class PetWindow(QWidget):
         self._bubble_timer.stop()
         self._agent_bubble.show_text(text,conversation_id)
         self.update()
+
+    def _open_pymaster(self):
+        """右键菜单入口：打开教学站，并把语音用法说清楚。浏览器启动不占用 UI 线程。"""
+        self._on_user_interaction()
+        self._show_agent_bubble('正在打开 PyMaster…')
+        def work():
+            try:
+                from core.pymaster_bridge import PyMasterBridge
+                bridge=getattr(self,'_pymaster_bridge',None)
+                if bridge is None:
+                    bridge=self._pymaster_bridge=PyMasterBridge()
+                result=bridge.open()
+                if result.get('ok'):
+                    chapter=result.get('chapter')
+                    where=('第 %d 章' % chapter) if chapter else '学习仪表盘'
+                    text='PyMaster 已打开（%s）。直接跟我说：打开第 3 章 / 下一个知识点 / 打开练习 / 运行一下 / 这题错在哪。' % where
+                else:
+                    text='PyMaster 没打开：'+str(result.get('error') or '未知原因')[:120]
+            except Exception as exc:
+                text='PyMaster 没打开：'+type(exc).__name__+': '+str(exc)[:100]
+            QTimer.singleShot(0,lambda:self._show_agent_bubble(text))
+        threading.Thread(target=work,daemon=True,name='guga-pymaster-open').start()
 
     def _say_agent_reply(self,text,expression=None,action='none',speak=False,conversation_id=None):
         """One desktop bubble for agent speech; optional TTS does not draw another card."""
@@ -1766,7 +1795,8 @@ class PetWindow(QWidget):
         if self._asr is None:
             self._asr = ASRRecorder()
         if not self._asr.available:
-            self._say_with_expression("咕嘎？语音模块没就绪，用打字吧。", "sad", "none")
+            hint = getattr(self._asr, 'hint', '语音模块没就绪')
+            self._say_with_expression(f"咕嘎？{hint}，先用打字吧。", "sad", "none")
             return
         self._recording = True
         self._asr.start()
@@ -1901,6 +1931,144 @@ class PetWindow(QWidget):
         if self._anim is not self._anim2d:
             self._anim.trigger_action('tsundere' if name=='head_shake' else name)
         self.update()
+
+    # ==================== 桌面走动 ====================
+
+    # 屏幕上每秒走多少像素。行走素材是 24 帧一个循环（约 1 秒两步），
+    # 移动速度和步频对不上就会"滑冰"——脚在原地踏步、身体平移。
+    WALK_SPEED = 150.0
+    WALK_DEFAULT_SECONDS = 2.6
+    WALK_EDGE_GAP = 24
+
+    def _walk_state(self):
+        return getattr(self, '_walk_timer', None)
+
+    def _ensure_walk_timer(self):
+        timer = getattr(self, '_walk_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(90)
+            timer.timeout.connect(self._walk_tick)
+            self._walk_timer = timer
+        return timer
+
+    def walk(self, direction='left', pixels=None, seconds=None):
+        """沿屏幕横向走一段，同时播对应方向的行走循环。direction 可为 left/right/auto/stop。"""
+        direction = str(direction or 'left').strip().lower()
+        if direction in ('stop', 'none', 'halt', 'stay'):
+            return self.stop_walk()
+        if direction in ('auto', 'random', 'any', ''):
+            direction = self._walk_roomier_side()
+
+        # 已经在走、或还带着抛掷惯性：先收干净，别让两套位移同时抢窗口
+        if getattr(self, '_walk_plan', None) is not None or self._pet_physics.mode:
+            self.stop_walk()
+
+        if not self.isVisible():
+            return dict(ok=False, error='桌宠当前是隐藏状态，先让它显示出来再走')
+
+        area = self.screen().availableGeometry()
+        x, y = self.x(), self.y()
+        if pixels is not None and float(pixels) > 0:
+            distance = float(pixels)
+        else:
+            distance = self.WALK_SPEED * float(seconds or self.WALK_DEFAULT_SECONDS)
+        distance = min(distance, 1600.0)
+
+        if direction == 'left':
+            room = x - area.left()
+            travel = -min(distance, max(0.0, room - self.WALK_EDGE_GAP))
+        else:
+            room = area.right() - (x + self.width())
+            travel = min(distance, max(0.0, room - self.WALK_EDGE_GAP))
+
+        if abs(travel) < 6:
+            return dict(ok=False, direction=direction,
+                        error='这一侧已经贴着屏幕边缘了，往另一边走吧',
+                        x=x, y=y)
+
+        span = abs(travel / self.WALK_SPEED)
+        # 自己推进窗口位置：桌宠自带的 physics.walk 会强制播它自己的
+        # personality:walk，还要求当前正好停在 idle——语音指令常常碰上入场动画
+        # 就被拒。这里用真实左右走素材，位移也只按自己的节奏走。
+        self._walk_plan = dict(start_x=x, travel=travel, seconds=max(0.25, span),
+                               started=time.monotonic(), direction=direction)
+        played = self._anim2d.play_walk(direction)
+        if self._anim is not self._anim2d and hasattr(self._anim, 'play_walk'):
+            self._anim.play_walk(direction)
+        self._walk_direction = direction
+        self._walk_started_x = x
+        self._ensure_walk_timer().start()
+        return dict(ok=True, direction=direction, distance=int(round(travel)),
+                    seconds=round(span, 2), animated=bool(played),
+                    x=x, y=y)
+
+    def _walk_roomier_side(self):
+        area = self.screen().availableGeometry()
+        left_room = self.x() - area.left()
+        right_room = area.right() - (self.x() + self.width())
+        return 'left' if left_room >= right_room else 'right'
+
+    def _walk_tick(self):
+        plan = getattr(self, '_walk_plan', None)
+        timer = getattr(self, '_walk_timer', None)
+        if plan is None:
+            if timer is not None:
+                timer.stop()
+            self._finish_walk()
+            return
+        if not self.isVisible() or getattr(self, '_is_drag', False):
+            self.stop_walk()
+            return
+        elapsed = time.monotonic() - plan['started']
+        u = max(0.0, min(1.0, elapsed / max(0.1, plan['seconds'])))
+        eased = u * u * (3 - 2 * u)          # 起步和收尾都软一点，别突然一顿
+        self.move(int(round(plan['start_x'] + plan['travel'] * eased)), self.y())
+        if u >= 1.0:
+            self._walk_plan = None
+            try:
+                self._config.save_pos(self.x(), self.y())
+            except Exception:
+                pass
+            if timer is not None:
+                timer.stop()
+            self._finish_walk()
+
+    def _finish_walk(self):
+        self._anim2d.stop_walk()
+        if self._anim is not self._anim2d and hasattr(self._anim, 'stop_walk'):
+            self._anim.stop_walk()
+        self._walk_direction = None
+        self.update()
+
+    def stop_walk(self):
+        """立刻停下：管道指令、拖拽、退出都走这里。"""
+        plan = getattr(self, '_walk_plan', None)
+        self._walk_plan = None
+        moving = plan is not None or self._pet_physics.mode == 'walk'
+        if self._pet_physics.mode == 'walk':
+            self._pet_physics.stop()
+        if moving:
+            # stop() 不经过 settled 回调，位置要自己记一下，否则下次启动会回到旧地方
+            try:
+                self._config.save_pos(self.x(), self.y())
+            except Exception:  # noqa: BLE001 - 位置没记上不影响停下
+                pass
+        timer = getattr(self, '_walk_timer', None)
+        if timer is not None:
+            timer.stop()
+        if moving or self._anim2d.walking:
+            self._finish_walk()
+            return dict(ok=True, stopped=True, message='停下了')
+        return dict(ok=True, stopped=False, message='本来就没在走')
+
+    def walk_command(self, target):
+        """语音/工具入口：target 是 left/right/auto/stop。"""
+        result = self.walk(target)
+        if result.get('ok') and 'message' not in result:
+            result['message'] = {'left': '好，往左走～',
+                                 'right': '好，往右走～'}.get(result.get('direction')) or '走两步～'
+        return result
 
     def _show_avatar_actions(self):
         """Finite local demo; no microphone, API calls, music or task side effects."""
@@ -2736,6 +2904,9 @@ class PetWindow(QWidget):
         if getattr(self,'_experience',None):self._experience.stop()
         if self._entrance_sound:self._entrance_sound.stop()
         self._voice_record_timer.stop()
+        launcher=getattr(self,'_floating_launcher',None)
+        if launcher is not None:launcher.hide()
+        self.stop_walk()
         self._pet_physics.stop()
         if getattr(self,'_screen_tools',None):self._screen_tools.stop()
         if getattr(self,'_multi_agent',None):self._multi_agent.close()

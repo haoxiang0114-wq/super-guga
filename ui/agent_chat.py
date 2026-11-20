@@ -2826,6 +2826,9 @@ class AgentChatWindow(QDialog):
         elif command.get('action')=='performance':
             if command.get('kind')=='gesture':
                 self._active_gesture(command['target']);result=dict(ok=True)
+            elif command.get('kind')=='walk':
+                walker=getattr(self.pet,'walk_command',None)
+                result=walker(command.get('target','auto')) if walker else dict(ok=False,error='当前环境没有可移动的桌宠窗口')
             else:
                 result=self.runtime.execute('music_performance',dict(action={'music_stop':'stop','music_pause':'pause','music_resume':'resume'}.get(command.get('kind'),'sing'),title=command.get('target','')))
         else:result=execute(command)

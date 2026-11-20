@@ -4,7 +4,7 @@ from pathlib import Path
 from PyQt5.QtCore import QObject,QPoint,Qt,pyqtSignal
 from PyQt5.QtGui import QColor,QFont,QPainter,QCursor
 from ui.attention_preview import AttentionPreview
-from PyQt5.QtWidgets import QInputDialog,QMenu,QWidget
+from PyQt5.QtWidgets import QInputDialog,QMenu,QWidget,QToolTip
 
 from core.agent_memory import AgentMemoryStore
 from core.agent_council import DiscussionWorker
@@ -79,10 +79,25 @@ class CompanionWindow(QWidget):
         layout=QVBoxLayout(dialog);label=QLabel();layout.addWidget(label)
         slider=QSlider(Qt.Horizontal);slider.setRange(40,100);slider.setValue(round(self._pet_scale*100));layout.addWidget(slider)
         def changed(value):
-            label.setText(str(value)+'% · 原尺寸为最大值');self.set_scale(value/100)
-        slider.valueChanged.connect(changed);label.setText(str(slider.value())+'% · 原尺寸为最大值')
+            label.setText(str(value)+'% · 原尺寸为最大值（鼠标滚轮也能缩放）');self.set_scale(value/100)
+        slider.valueChanged.connect(changed);label.setText(str(slider.value())+'% · 原尺寸为最大值（鼠标滚轮也能缩放）')
         row=QHBoxLayout();reset=QPushButton('恢复原尺寸');reset.clicked.connect(lambda:slider.setValue(100));row.addWidget(reset)
         done=QPushButton('完成');done.clicked.connect(dialog.accept);row.addWidget(done);layout.addLayout(row);dialog.exec_()
+
+    def wheelEvent(self,event):
+        """滚轮缩放：和主桌宠一致，上滚变大、下滚变小。"""
+        delta=event.angleDelta().y()
+        if not delta:
+            event.ignore();return
+        notches=int(delta/120) or (1 if delta>0 else -1)
+        notches=max(-4,min(4,notches))
+        target=round(max(.4,min(1.,self._pet_scale+notches*.05)),2)
+        if abs(target-self._pet_scale)<1e-6:
+            QToolTip.showText(event.globalPos(),'已到'+('最大' if self._pet_scale>=1 else '最小')+' · %d%%'%round(self._pet_scale*100),self,self.rect(),1200)
+            event.accept();return
+        self.set_scale(target)
+        QToolTip.showText(event.globalPos(),'大小 %d%%'%round(self._pet_scale*100),self,self.rect(),1200)
+        event.accept()
 
     def _with_identity(self,callback):
         panel=self.owner._ensure_agent_panel()

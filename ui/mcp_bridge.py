@@ -40,6 +40,14 @@ class SelfMCPBridge(QObject):
         try:
             request = json.loads(bytes(socket.readLine()).decode('utf-8'))
             name, args = request['name'], request.get('arguments', {})
+            if name=='pet_control':
+                # 桌面快捷方式开关用：走管道退出，让 _quit() 把位置/状态存盘，
+                # 而不是直接杀进程（强杀会丢位置和数值）。
+                if str((args or {}).get('action') or '')!='quit':
+                    raise ValueError('pet_control 只支持 quit')
+                self._respond(socket,dict(ok=True,result=dict(action='quit')))
+                QTimer.singleShot(200,self.pet._quit)
+                return
             if name=='dsh_host_event':
                 if not request.get('plugin_event') or not isinstance(args,dict):raise ValueError('需要咕嘎原生 DSH 插件回执通道')
                 result=self.pet._ensure_agent_panel().runtime.dsh_link.receive(args)

@@ -33,5 +33,28 @@
     "free_quota_confirmed_model": "",
     "provider": "qianwen",
     "free_quota_confirmed_provider": ""
+  },
+  "qwen_speech": {
+    "enabled": true,
+    "provider": "",
+    "api_key": "",
+    "base_url": "",
+    "asr_model": "qwen3-asr-flash",
+    "tts_model": "qwen3-tts-flash",
+    "tts_voice": "Cherry",
+    "language_type": "Chinese",
+    "asr_backend": "auto",
+    "timeout": 30
+  },
+  "qwen_chat": {
+    "enabled": true,
+    "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+    "model": "deepseek-v4.1-flash-1017",
+    "note": "聊天模型没填时，借用 qwen_speech.api_key 走千问 MaaS 兼容通道；填了自己的 base_url/api_key 则不生效"
+  },
+  "pymaster": {
+    "url": "https://www.workbuddy.link/p/uTIQLihsxWIj6pIM7Cx8lc",
+    "speak_lookup": true,
+    "headless": false
   }
 }

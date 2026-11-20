@@ -189,7 +189,12 @@ class DesktopExperience(QObject):
 
 def add_experience_tabs(console,tabs,pet):
     """The pages save independently of model keys and perform no work on construction."""
-    experience=pet._experience;s=pet._config._s
+    # 设置台也用于无桌宠的调试/测试场景（例如只验模型配置），缺省时静默跳过
+    experience=getattr(pet,'_experience',None)
+    config=getattr(pet,'_config',None)
+    if experience is None or config is None:
+        return
+    s=config._s
     page=QWidget();form=QFormLayout(page)
     shortcut=QCheckBox('双击左 Ctrl 打开打字框');shortcut.setChecked(s.value('experience/typing_shortcut',True,type=bool))
     draft=QCheckBox('语音识别后先放入打字框');draft.setChecked(s.value('experience/voice_draft',False,type=bool))

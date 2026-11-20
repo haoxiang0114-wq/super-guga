@@ -13,6 +13,7 @@ MODULES=(
     'floating_chat','fresh_context','recording_draft','realtime_voice',
     'long_voice_stability','voice_resilience','voice_conversation_controls',
     'daily_plan','super_agent_tools','companion_workbench','agent_identity','workflow_catalog',
+    'pymaster','sticker','emoji_harvest','sticker_motion','doubao_upload','walk',
 )
 
 

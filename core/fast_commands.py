@@ -192,6 +192,42 @@ def _unresolved_site_candidate(target):
     return True
 
 
+_WALK_MOTION_WORDS = ('走', '去', '挪', '移', '散步', '溜达', '过去', '过来')
+_WALK_STOP = re.compile(r'(?:先)?(?:别|不要|不用|停止)走了?|站住|停下(?:来|吧|了)?|不走了?|停止走动|停下脚步|别晃了')
+_WALK_PASS = frozenset(('走一走', '走两步', '走几步', '走走', '随便走走', '散散步', '散步',
+                        '溜达一下', '溜达溜达', '走一段', '走两下', '活动一下'))
+_WALK_VAGUE = re.compile(
+    r'(?:往|朝|向)?(?:那|这)边(?:走|去|过去|走一走|走走|走两步|走几步|走一段)?'
+    r'(?:一下|一点|吧|呗|两步|几步)*$')
+_WALK_DIR = re.compile(
+    r'(?:把)?(?:窗口|桌宠|身体|身子|自己)?(?:朝|向|往)?(?:你|我|他|她|它)?(?:给我|帮我|先)?(?:往|向|朝|走|去|挪|移)?(?:到)?(?:屏幕|桌面)?(?:的)?'
+    r'(?P<side>左|右)(?:边|侧|面|手边)?'
+    # 运动词允许连用："走过去""往那边走两步"都是两段词
+    r'(?:(?:那边|这边|过)?(?:去|走|走一走|走走|走几步|走一段|散步|溜达|挪|移动|过去)){0,2}'
+    r'(?:一下|一点|一些|吧|呗|啊|呀|哦|啦|呢|吗|么|几步|一段|两步|三点)*$')
+
+
+def parse_walk(value):
+    """把"向左走/走到右边/随便走走/别走了"解析成 left|right|auto|stop。
+
+    只认明确的走动说法：光说"左边"不会触发，免得和"左边的文件"混淆。
+    """
+    text = str(value or '').strip()
+    if not text:
+        return None
+    if _WALK_STOP.fullmatch(text):
+        return 'stop'
+    if text in _WALK_PASS:
+        return 'auto'
+    if _WALK_VAGUE.fullmatch(text):
+        # 没有左右方向，但确实是"走一段"的意思，交给 auto 挑空的一边
+        return 'auto'
+    found = _WALK_DIR.fullmatch(text)
+    if found and any(word in text for word in _WALK_MOTION_WORDS):
+        return 'left' if found.group('side') == '左' else 'right'
+    return None
+
+
 # ---------------------------------------------------------------------------
 # match(): 把一句话路由成一条结构化命令（只解析，不执行任何动作）
 #
@@ -372,6 +408,15 @@ def _match_gesture(ctx):
         return None
     return dict(ctx.prefix, matched=True, action='performance', kind='gesture',
                 target=gesture, silent=True)
+
+
+def _match_walk(ctx):
+    """「向左走」「往右边走过去」「别走了」——沿屏幕走一段，不是桌面操作。"""
+    target = parse_walk(ctx.value)
+    if not target:
+        return None
+    return dict(ctx.prefix, matched=True, action='performance', kind='walk',
+                target=target, silent=True, priority='fast')
 
 
 def _match_music_stop(ctx):
@@ -675,6 +720,7 @@ _MATCH_RULES = (
     _match_dsh_follow,
     _match_daily_plan,
     _match_input_method_question,
+    _match_walk,
     _match_desktop_or_browser_step,
     _match_work_tail,
     _match_summon,

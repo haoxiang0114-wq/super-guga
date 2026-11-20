@@ -33,7 +33,22 @@ def tool_feedback(name,args,result=None):
         ('screen_share','context'):'正在读取当前共享画面上下文',
         ('screen_share','snapshot'):'正在读取共享屏幕的最新画面',
         ('local_computer','read'):'正在读取'+(subject or '目标文件'),('local_computer','write'):'正在备份并写入'+(subject or '目标文件'),
-        ('local_computer','run'):'正在执行命令并等待验证结果',('applications','open'):'正在打开目标软件'}
+        ('local_computer','run'):'正在执行命令并等待验证结果',('applications','open'):'正在打开目标软件',
+        ('pymaster','status'):'正在确认 PyMaster 浏览器状态',('pymaster','open'):'正在打开 PyMaster 学习站',
+        ('pymaster','state'):'正在读取 PyMaster 当前页面',('pymaster','chapter'):'正在翻到目标章节',
+        ('pymaster','kp'):'正在展开这个知识点',('pymaster','next'):'正在翻到下一个知识点',
+        ('pymaster','prev'):'正在回到上一个知识点',('pymaster','open_exercise'):'正在打开课后练习',
+        ('pymaster','set_code'):'正在把代码写进编辑器',('pymaster','run'):'正在浏览器里运行这段代码',
+        ('pymaster','explain'):'正在整理代码、报错和知识点',('pymaster','glossary'):'正在查站内术语表',
+        ('pymaster','close_modal'):'正在关掉练习弹窗',
+        ('sticker','list'):'正在读取表情库',('sticker','import'):'正在适配表情并写入待机动画',
+        ('sticker','import_folder'):'正在逐个适配文件夹里的表情',
+        ('sticker','probe'):'正在试算适配后的帧数',
+        ('sticker','enable'):'正在启用这个表情',('sticker','disable'):'正在停用这个表情',
+        ('sticker','remove'):'正在移除这个表情',
+        ('sticker','doubao_status'):'正在检查豆包生图登录态',
+        ('sticker','doubao_check'):'正在把这张表情传到豆包试一下',
+        ('pet_control','walk'):'正在往那边走'}
     summary=labels.get((name,action),'正在执行下一步操作')
     if result is not None:
         payload=result.get('result') if isinstance(result.get('result'),dict) else result

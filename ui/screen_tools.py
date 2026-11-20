@@ -3,6 +3,7 @@ import base64
 import ctypes
 import ctypes.wintypes
 import html
+import re
 import threading
 from PyQt5.QtCore import (Qt,QRect,QBuffer,QIODevice,QObject,pyqtSignal,
     QTimer,QAbstractNativeEventFilter)
@@ -78,7 +79,7 @@ class ExplainDialog(QDialog):
         self.setWindowIcon(member_icon('001'));self.setStyleSheet(SETTINGS_STYLE+'QTextEdit,QTextBrowser{background:white;border:1px solid #e0e6f0;border-radius:9px;padding:10px;font:13px "Microsoft YaHei UI";}')
         box=QVBoxLayout(self);box.addWidget(QLabel('临时会话 · 不加入聊天历史 · 关闭后清空'))
         actions=QHBoxLayout();self.action_combo=QComboBox()
-        for text,value in (('解释','explain'),('翻译','translate'),('优化提示词','optimize')):self.action_combo.addItem(text,value)
+        for text,value in (('查词','lookup'),('解释','explain'),('翻译','translate'),('优化提示词','optimize')):self.action_combo.addItem(text,value)
         self.action_combo.currentIndexChanged.connect(self._change_action);actions.addWidget(self.action_combo)
         self.language=QComboBox();self.language.addItems(['自动','简体中文','英文','日文','韩文','法文','德文','西班牙文'])
         self.language.setToolTip('自动：中文译为英文，其他语言译为中文');self.language.currentIndexChanged.connect(self._translate_again);actions.addWidget(self.language);self.language.hide()
@@ -179,6 +180,20 @@ class ExplainDialog(QDialog):
             except Exception as exc:self.reply.emit(generation,str(exc),False)
         threading.Thread(target=work,daemon=True).start()
 
+    def speak_lookup(self,text):
+        """查词结果顺手念一遍：短句、去掉 Markdown，避免把符号读出来。"""
+        engine=getattr(self.parent(),'_tts',None)
+        if engine is None:return
+        try:
+            from core.pymaster_bridge import settings as _pm_settings
+            if not _pm_settings()['speak_lookup']:return
+        except Exception:pass
+        plain=re.sub(r'[`*_#>\[\]|]','',str(text or '')).replace('\n','，')
+        plain=re.sub(r'\s+',' ',plain).strip(' ，,')
+        if len(plain)<2:return
+        try:engine.speak(plain[:240])
+        except Exception:pass
+
     def received(self,generation,text,ok):
         self._request_active=False
         if generation!=self.generation:
@@ -186,7 +201,9 @@ class ExplainDialog(QDialog):
             if queued:self.ask(queued)
             return
         self.pending=False;self.send.setEnabled(True);self.status.setText('仅在本临时会话内追问' if ok else '未完成，可重试')
-        if ok:self.messages.append(dict(role='assistant',content=text));self.last_answer=text;self.copy.setEnabled(True);self.apply_button.setEnabled(True)
+        if ok:
+            self.messages.append(dict(role='assistant',content=text));self.last_answer=text;self.copy.setEnabled(True);self.apply_button.setEnabled(True)
+            if self.mode=='lookup':self.speak_lookup(text)
         self.answer.append('<p style="color:#8290a8">'+html.escape(self.messages[-2]['content'] if ok else '提示')+'</p><p>'+html.escape(text).replace('\n','<br>')+'</p>')
 
     def closeEvent(self,event):
@@ -202,7 +219,7 @@ class SelectionBar(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating);self.payload={};self.presentation=0
         self.setStyleSheet('QWidget{background:#fff;border:1px solid #e1e5ed;border-radius:8px;} QPushButton{border:0;background:transparent;padding:6px 10px;font:12px "Microsoft YaHei UI";} QPushButton:hover{background:#edf2ff;border-radius:6px;}')
         row=QHBoxLayout(self);row.setContentsMargins(3,2,3,2);row.setSpacing(1)
-        for label,mode in (('截图提问','analyze'),('解释','explain'),('翻译','translate'),('优化提示词','optimize')):
+        for label,mode in (('查词','lookup'),('截图提问','analyze'),('解释','explain'),('翻译','translate'),('优化提示词','optimize')):
             b=QPushButton(label);b.setFocusPolicy(Qt.NoFocus);b.clicked.connect(lambda checked=False,m=mode:self.pick(m));row.addWidget(b)
         close=QPushButton('×');close.setFocusPolicy(Qt.NoFocus);close.clicked.connect(self.dismiss);row.addWidget(close)
         self.timer=QTimer(self);self.timer.setSingleShot(True);self.timer.timeout.connect(self.dismiss)

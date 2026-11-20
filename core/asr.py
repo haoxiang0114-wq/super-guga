@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
-"""咕嘎企鹅语音识别模块 — 麦克风录音 + Vosk 离线中文识别
+"""咕嘎企鹅语音识别模块 — 麦克风录音 + 千问在线 / Vosk 离线识别
 
-- 依赖：sounddevice（录音）、vosk（识别）
-- 模型：vosk-model-small-cn（首次自动下载到 .zcode/tools/vosk-model-cn）
+两种后端：
+- qwen ：千问 qwen3-asr-flash（准，需要 API Key 和网络）
+- vosk ：本地 vosk-model-small-cn（离线，无网络依赖）
+后端选择：asr_backend = auto / qwen / vosk
+    auto（默认）配置了千问密钥就走千问，千问失败时回落到本地 Vosk；
+    本地模型不存在则保持千问并在失败时明确报错。
+
+- 依赖：sounddevice（录音）、vosk（离线识别，可选）
+- 模型：vosk-model-small-cn（在 .zcode/tools/vosk-model-cn）
 - 自动增益：录音时按峰值归一化（笔记本麦克风通常声音偏小）
 - 用法：
     recorder = ASRRecorder()
@@ -15,6 +22,14 @@ import logging
 import os
 import queue
 import threading
+
+# 单次录音上限（30 秒，16k/16bit 单声道 ≈ 960KB），防止长按把内存吃满
+_MAX_PCM_BYTES = 16000 * 2 * 30
+# 少于 0.35 秒基本是误触
+_MIN_PCM_BYTES = 16000 * 2 * 35 // 100
+
+_VOSK_MODEL = None
+_VOSK_LOCK = threading.Lock()
 
 # 模型下载地址（若缺失）
 VOSK_MODEL_URL = 'https://alphacephei.com/vosk/models/vosk-model-small-cn-0.3.zip'
@@ -96,10 +111,74 @@ def _ensure_model_dir() -> str:
 MODEL_DIR = _ensure_model_dir()
 
 
+def resolve_backend(preferred=None):
+    """返回实际使用的后端名：qwen 或 vosk。"""
+    if preferred in ('qwen', 'vosk'):
+        return preferred
+    from core.qwen_speech import available, read_raw, speech_settings
+    raw = read_raw()
+    wanted = str(raw.get('asr_backend') or (raw.get('qwen_speech') or {}).get('asr_backend') or 'auto').lower()
+    if wanted in ('qwen', 'vosk'):
+        return wanted
+    return 'qwen' if available(speech_settings(raw)) else 'vosk'
+
+
+def _local_model():
+    """懒加载本地 Vosk 模型（只加载一次，供千问失败时兜底）。"""
+    global _VOSK_MODEL
+    if _VOSK_MODEL is not None:
+        return _VOSK_MODEL
+    with _VOSK_LOCK:
+        if _VOSK_MODEL is not None:
+            return _VOSK_MODEL
+        import vosk
+        if not os.path.isdir(MODEL_DIR):
+            return None
+        try:
+            _VOSK_MODEL = vosk.Model(MODEL_DIR)
+        except Exception:
+            return None
+    return _VOSK_MODEL
+
+
+def local_available() -> bool:
+    """本地 Vosk 是否可用（小模型平铺在根目录，大模型在 am/ 下）。"""
+    try:
+        import vosk  # noqa: F401
+    except ImportError:
+        return False
+    if not os.path.isdir(MODEL_DIR):
+        return False
+    return (os.path.isfile(os.path.join(MODEL_DIR, 'final.mdl'))
+            or os.path.isdir(os.path.join(MODEL_DIR, 'am')))
+
+
+def transcribe_pcm_local(pcm, rate=16000) -> str:
+    """用本地 Vosk 识别一段裸 PCM（兜底路径）。"""
+    if not pcm:
+        return ''
+    model = _local_model()
+    if model is None:
+        return ''
+    try:
+        import vosk
+        import json as _json
+        recognizer = vosk.KaldiRecognizer(model, rate)
+        text = ''
+        step = rate * 2
+        for start in range(0, len(pcm), step):
+            if recognizer.AcceptWaveform(bytes(pcm[start:start + step])):
+                text += _json.loads(recognizer.Result()).get('text', '')
+        text += _json.loads(recognizer.FinalResult()).get('text', '')
+        return text.strip()
+    except Exception:
+        return ''
+
+
 class ASRRecorder:
     """按住说话式录音器（start 开始，stop 结束并转写）"""
 
-    def __init__(self):
+    def __init__(self, backend=None):
         self._q = queue.Queue()
         self._stream = None
         self._recording = False
@@ -108,6 +187,8 @@ class ASRRecorder:
         self._model = None
         self._sd = None
         self._vosk = None
+        self._pcm = bytearray()
+        self.backend = resolve_backend(backend)
         self.result = ''
         self.error = None
         self.device = None
@@ -118,12 +199,21 @@ class ASRRecorder:
         self.backend='vosk';self._pcm=[]
 
     @property
+    def hint(self) -> str:
+        """没有就绪时给用户看的话（区分在线/离线通道）。"""
+        if self.backend == 'qwen':
+            return '千问语音没就绪：检查 API Key 和网络'
+        return '离线语音识别没就绪：检查 Vosk 模型和麦克风依赖'
+
+    @property
     def available(self) -> bool:
-        """依赖与模型是否就绪"""
+        """依赖与模型是否就绪（先绑依赖，否则 _ensure_model 永远看到 _vosk=None）"""
         if not self._check_imports():
             return False
-        from core.local_transcription import available
-        if available():self.backend='whisper-small';return True
+        from core.local_transcription import available as local_available
+        if local_available():
+            self.backend='whisper-small'
+            return True
         return self._ensure_model()
 
     def _check_imports(self):
@@ -177,6 +267,35 @@ class ASRRecorder:
         self._thread = threading.Thread(target=self._record_loop, daemon=True)
         self._thread.start()
 
+    def _collect(self, data):
+        """把一块音频交给当前后端：Vosk 流式识别，或累积给千问整段识别。"""
+        if self._recognizer is not None:
+            try:
+                if self._recognizer.AcceptWaveform(data):
+                    import json as _json
+                    try:
+                        txt = _json.loads(self._recognizer.Result()).get('text', '')
+                        if txt:
+                            self.result += txt
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return
+        # 千问/whisper 需要整段音频：按块累积并压住 30 秒上限
+        self._pcm.append(data)
+        while sum(len(b) for b in self._pcm) > _MAX_PCM_BYTES:
+            self._pcm.pop(0)
+
+    def _drain(self):
+        """取干净队列里的尾部音频（停止瞬间可能还有几帧）。"""
+        while True:
+            try:
+                data = self._q.get_nowait()
+            except queue.Empty:
+                return
+            self._collect(data)
+
     def _record_loop(self):
         import sounddevice as sd
         try:
@@ -186,16 +305,7 @@ class ASRRecorder:
                     # 持续消费队列，交给 recognizer
                     try:
                         data = self._q.get(timeout=0.3)
-                        self._pcm.append(data)
-                        if self._recognizer is not None and self._recognizer.AcceptWaveform(data):
-                            res = self._recognizer.Result()
-                            import json as _json
-                            try:
-                                txt = _json.loads(res).get('text', '')
-                                if txt:
-                                    self.result += txt
-                            except Exception:
-                                pass
+                        self._collect(data)
                     except queue.Empty:
                         continue
         except Exception as e:
@@ -241,6 +351,7 @@ class ASRRecorder:
                     self.error = '离线语音识别暂不可用，请检查本地中文识别模型'
             return self.result.strip()
         # 取残留
+        self._drain()
         if self._recognizer is not None:
             try:
                 res = self._recognizer.FinalResult()
@@ -253,7 +364,32 @@ class ASRRecorder:
                     pass
             except Exception:
                 pass
-        return self.result.strip()
+            return self.result.strip()
+        return self._finish_qwen(pcm)
+
+    def _finish_qwen(self, pcm=None) -> str:
+        """千问通道：整段 PCM → WAV → qwen3-asr-flash；失败回落本地 Vosk。"""
+        pcm = b''.join(pcm if pcm is not None else self._pcm)
+        if len(pcm) < _MIN_PCM_BYTES:
+            self.error = '录音太短，按住说话再说一次'
+            return ''
+        from core.qwen_speech import pcm_to_wav
+        try:
+            from core.qwen_speech import transcribe
+            text = transcribe(pcm_to_wav(pcm), 'audio/wav').strip()
+            if text:
+                self.result = text
+                return text
+        except Exception as exc:
+            self.error = str(exc) or '千问语音识别失败'
+        # 在线识别不可用时，能本地兜底就兜底，不让主人白说一遍
+        if local_available():
+            local = transcribe_pcm_local(pcm)
+            if local:
+                self.result = local
+                self.error = None
+                return local
+        return ''
 
     def _transcribe_backup(self, pcm):
         if not self._ensure_model():

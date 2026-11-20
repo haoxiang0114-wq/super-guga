@@ -68,6 +68,206 @@ class AppRuntime:
                 QTimer.singleShot(700,restore)
         except (OSError,ValueError,TypeError):pass
 
+    def _pymaster(self,args):
+        """PyMaster 教学站遥控：固定动作，页面文字只作资料。"""
+        from core.pymaster_bridge import PyMasterBridge
+        # 菜单和语音共用同一个桥，避免各自拉起一个浏览器
+        bridge=getattr(self.pet,'_pymaster_bridge',None)
+        if bridge is None:
+            bridge=PyMasterBridge()
+            self.pet._pymaster_bridge=bridge
+        action=str(args.get('action','status')).strip().lower()
+        try:
+            if action=='status':
+                return bridge.run('status')
+            if action=='glossary':
+                term=str(args.get('term') or args.get('query') or '').strip()
+                if not term:raise ValueError('查词需要 term')
+                return bridge.run('glossary',term=term)
+            if action=='close_modal':
+                return dict(bridge.run('close_modal'),action='close_modal')
+            if action in ('open','state','chapter','kp','next','prev','open_exercise','set_code','run','explain'):
+                if action=='open':
+                    result=bridge.open(page=args.get('page'),chapter=args.get('chapter'))
+                elif action=='chapter':
+                    number=int(args.get('chapter') or 0)
+                    if not number:raise ValueError('跳章需要 chapter（1 起）')
+                    result=bridge.chapter(number)
+                elif action=='kp':
+                    result=bridge.kp(int(args.get('index') or 0))
+                elif action in ('next','prev'):
+                    result=bridge.run(action)
+                elif action=='open_exercise':
+                    result=bridge.open_exercise(kp=args.get('kp'),ex=int(args.get('ex') or 0))
+                elif action=='set_code':
+                    code=str(args.get('code') or '')
+                    if not code.strip():raise ValueError('set_code 需要 code')
+                    result=bridge.set_code(code)
+                elif action=='run':
+                    result=bridge.run_code(int(args.get('seconds') or 75))
+                elif action=='explain':
+                    result=bridge.explain_bundle(str(args.get('question') or ''))
+                else:
+                    result=bridge.state()
+                return self._pymaster_view(action,result)
+            raise ValueError('未知 PyMaster 操作：'+action)
+        except Exception as exc:
+            return dict(ok=False,action=action,error=type(exc).__name__+': '+str(exc)[:300])
+
+    def _sticker_log(self,msg):
+        """补帧/生图的进度，收集起来随结果一起给智能体，不打断对话。"""
+        try:
+            notes=getattr(self,'_sticker_notes',None)
+            if notes is None:
+                notes=[]; self._sticker_notes=notes
+            notes.append(str(msg))
+            del notes[:-12]
+        except Exception:
+            pass
+
+    def _sticker(self,args):
+        """表情包工坊：动作固定，结果直接给智能体读。"""
+        from core import sticker_studio as studio
+        action=str(args.get('action','list')).strip().lower()
+        known=('list','import','import_folder','enable','disable','remove','probe',
+               'doubao_status','doubao_check')
+        if action not in known:
+            return dict(ok=False,error='未知表情动作：'+action+'（可用：'+'/'.join(known)+'）')
+        ok,why=studio.available()
+        if not ok:return dict(ok=False,error=why)
+        settle=lambda r:(self._sticker_after(r) if callable(getattr(self,'_sticker_after',None)) else r)
+        try:
+            if action=='list':
+                items=studio.list_stickers()
+                return dict(ok=True,total=len(items),
+                    items=[dict(slug=it.get('slug'),name=it.get('name'),frames=it.get('frames'),
+                                fps=it.get('fps'),weight=it.get('weight'),
+                                enabled=bool(it.get('enabled')),created=it.get('created')) for it in items],
+                    idle_clips=studio.manifest_clips(),
+                    message=('表情库有 %d 个自定义表情'%len(items)) if items
+                            else '表情库还是空的：可以说"把这个文件做成表情"')
+            if action=='doubao_status':
+                try:
+                    from core import doubao_image as db
+                    st=db.status()
+                except Exception as exc:  # noqa: BLE001
+                    return dict(ok=False,error='豆包客户端不可用：%s'%str(exc)[:70])
+                try:
+                    from core import motion_library as ml
+                    lib=ml.summary()
+                except Exception:  # noqa: BLE001
+                    lib=''
+                return dict(ok=True,ready=bool(st.get('ready')),reason=st.get('reason'),
+                    motion_library=lib,
+                    message=('豆包已登录，AI 重绘可用' if st.get('ready')
+                             else '豆包还没登录：%s。在那之前只能用本地补帧'%st.get('reason')))
+            source=str(args.get('source') or '').strip()
+            if action in ('import','import_folder','probe','doubao_check') and not source:
+                return dict(ok=False,error='需要 source：素材文件或目录的真实路径（用户没给就不要编）')
+            if action=='doubao_check':
+                # 只验"这张表情能不能传进豆包"，不生图也不写库
+                try:
+                    frames,_delays=studio.decode_source(source)
+                except Exception as exc:  # noqa: BLE001
+                    return dict(ok=False,error='解不出表情帧：%s'%str(exc)[:70])
+                if not frames:
+                    return dict(ok=False,error='这个素材里没有可用的帧')
+                try:
+                    from core import doubao_image as db
+                    res=db.check_upload(frames[len(frames)//2],
+                                        log=getattr(self,'_sticker_log',None))
+                except Exception as exc:  # noqa: BLE001
+                    return dict(ok=False,error='传图自检失败：%s'%str(exc)[:80])
+                return dict(ok=bool(res.get('ok')),uploaded=int(res.get('uploaded') or 0),
+                            ready=bool(res.get('ready')),shot=res.get('shot') or '',
+                            message=res.get('reason') or '')
+            if action=='probe':
+                return studio.probe(source,args.get('fps') or studio.TARGET_FPS)
+            if action=='import_folder':
+                from pathlib import Path as _Path
+                if not _Path(source).expanduser().is_dir():
+                    return dict(ok=False,error='source 要是一个文件夹：%s'%source)
+                ok_list,bad_list=studio.import_folder(source,
+                    args.get('fps') or studio.TARGET_FPS,args.get('weight') or 1.0,
+                    smooth=int(args.get('smooth') or 0),
+                    doubao=bool(args.get('doubao')),
+                    log=getattr(self,'_sticker_log',None))
+                result=dict(ok=bool(ok_list),imported=[r['slug'] for r in ok_list],
+                    imported_names=[r['name'] for r in ok_list],
+                    skipped=[dict(name=n,reason=r) for n,r in bad_list],
+                    message='导入 %d 个表情%s'%(len(ok_list),
+                        ('，%d 个跳过（多半是已经导入过）'%len(bad_list)) if bad_list else ''))
+                if ok_list and any((r.get('smooth') or 1)>1 for r in ok_list):
+                    framed=[(r['name'],r['frames'],r['fps']) for r in ok_list]
+                    result['smooth']=[dict(name=n,frames=f,fps=fp) for n,f,fp in framed]
+                if not ok_list and not bad_list:
+                    result.update(ok=False,error='这个文件夹里没有认出表情')
+                return settle(result) if ok_list else result
+            if action=='import':
+                result=studio.import_sticker(source,args.get('name') or '',
+                                             args.get('fps') or studio.TARGET_FPS,
+                                             args.get('weight') or 1.0,args.get('slug') or '',
+                                             smooth=int(args.get('smooth') or 0),
+                                             doubao=bool(args.get('doubao')),
+                                             motion_hint=str(args.get('hint') or ''),
+                                             log=getattr(self,'_sticker_log',None))
+                return settle(result)
+            slug=str(args.get('slug') or '').strip()
+            if not slug:return dict(ok=False,error='需要 slug：先用 list 看库里的 id')
+            if action=='enable':return settle(studio.set_enabled(slug,True))
+            if action=='disable':return settle(studio.set_enabled(slug,False))
+            if action=='remove':return settle(studio.remove_sticker(slug))
+            return dict(ok=False,error='未知表情动作：'+action)
+        except studio.StickerError as exc:
+            return dict(ok=False,action=action,error=str(exc))
+        except Exception as exc:
+            return dict(ok=False,action=action,error=type(exc).__name__+': '+str(exc)[:200])
+
+    def _sticker_after(self,result):
+        """清单改了就热重载待机链，省掉"导入后要重启"这一步。"""
+        if not isinstance(result,dict) or not result.get('ok'):return result
+        anim=getattr(getattr(self,'pet',None),'_anim',None)
+        reload=getattr(anim,'reload_idle_clips',None)
+        if reload is None:return result
+        try:
+            live=reload()
+        except Exception:  # noqa: BLE001 - 热重载失败不该抹掉导入结果
+            return result
+        if live:
+            result['live_idle_clips']=list(live)
+            slug=result.get('slug')
+            if slug and slug in live:
+                result['message']=result.get('message','')+'（已即时接入待机链，不用重启）'
+            elif slug:
+                result['message']=result.get('message','')+'（已从待机链移除，立即生效）'
+            elif result.get('imported'):
+                result['message']=result.get('message','')+'（已即时接入待机链，不用重启）'
+        return result
+
+    @staticmethod
+    def _pymaster_view(action,result):
+        """压掉 DOM 噪音，只把智能体做判断需要的事实交回去。"""
+        if not isinstance(result,dict):return dict(ok=False,error='PyMaster 桥返回了异常结果')
+        view=dict(result)
+        view['action']=action
+        view.pop('state',None)
+        kps=view.get('kps')
+        if isinstance(kps,list) and len(kps)>20:
+            view['kps']=kps[:20];view['kps_total']=len(kps)
+        modal=view.get('modal')
+        if isinstance(modal,dict) and not modal.get('open'):
+            view['modal']=dict(open=False)
+        playground=view.get('playground')
+        if isinstance(playground,dict):
+            playground=dict(playground)
+            playground['code']=(playground.get('code') or '')[:1200]
+            playground['output']=(playground.get('output') or '')[:1500]
+            view['playground']=playground
+        for key in ('kp_text','code','output','exercise_prompt'):
+            if isinstance(view.get(key),str) and len(view[key])>2600:
+                view[key]=view[key][:2600]+'…'
+        return view
+
     def execute_internal(self, name, args):
         """Only the application's own ToolBridge uses this entry, never IPC args."""
         if (name=='codex_task' and args.get('action')=='start' and
@@ -208,6 +408,10 @@ class AppRuntime:
         if name=='desktop_command':
             from core.super_agent import desktop_command
             return desktop_command.handle(args.get('action','list'),args.get('target') or args.get('name',''),args.get('query',''))
+        if name=='pymaster':
+            return self._pymaster(args)
+        if name=='sticker':
+            return self._sticker(args)
         if name=='lingshu_memory':
             from core.super_agent import lingshu_memory
             return lingshu_memory.handle(args.get('action','status'),args.get('query',''),args.get('title',''),args.get('content',''))
@@ -719,6 +923,17 @@ class AppRuntime:
             return dict(action=action,expression=pet._anim.expression,
                         held=pet._anim.expression!='normal',
                         applied=pet._anim.expression==name)
+        elif action == 'walk':
+            target = str(args.get('name') or args.get('direction') or 'auto').strip().lower()
+            if target not in ('left', 'right', 'auto', 'stop'):
+                raise ValueError('走路方向只能是 left/right/auto/stop')
+            if str(getattr(self.panel, 'active_agent_id', '001')) != '001' and hasattr(pet, '_multi_agent'):
+                return dict(ok=False, error='同伴窗口不支持走动，先切回 001 再让它走')
+            result = pet.walk_command(target)
+            if not result.get('ok'):
+                raise ValueError(result.get('error') or '没能走起来')
+            return dict(action=action, direction=result.get('direction'), distance=result.get('distance'),
+                        animated=result.get('animated'), x=pet.x(), y=pet.y())
         elif action == 'interact':
             name = args.get('name', '')
             if name not in ('feed', 'play', 'pet', 'sleep', 'dance'):

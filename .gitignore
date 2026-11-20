@@ -83,6 +83,9 @@ runtime/personal-harness-probe/
 runtime/research/
 runtime/video-workflows/
 runtime/video-workflow-qa/
+# 上游同步状态与备份（本地用）
+.upstream.json
+.upstream_backup/
 
 # Local plugin market state when GUGA_HOME points to the checkout
 /plugins/installed/

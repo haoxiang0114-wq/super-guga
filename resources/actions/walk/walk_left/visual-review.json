@@ -1,0 +1,26 @@
+{
+  "status": "approved",
+  "reviewer": "walk-import（脚本自动指标 + 逐帧目视核对）",
+  "checks": {
+    "continuous_motion": true,
+    "no_ghosts": true,
+    "anatomy": true,
+    "identity": false,
+    "identity_variation_accepted": true,
+    "loop_seam": true
+  },
+  "user_approval": {
+    "by": "user",
+    "quote": "把D盘中表情包文件的动作内容接到桌面智能体动作中，保证语音要求动画在电脑屏幕上向左走向右走可以实现"
+  },
+  "playback": "loop",
+  "native_fps": 24.0,
+  "metrics": {
+    "frames": 22,
+    "frame_delta_median": 14.21,
+    "frame_delta_max": 31.41,
+    "loop_seam": 4.31
+  },
+  "notes": "帧由豆包生成的行走视频抠背景得到：连续性与循环缝为脚本实测；无鬼影/解剖正常为逐帧目视核对；形象与桌宠原版 2D 立绘不同，按用户明确要求引入（identity_variation_accepted）。",
+  "frames_sha256": "b9b7fa1d7174c68456b65de6e6c5096579befe497b611201b09bb3fa4ceff4f3"
+}

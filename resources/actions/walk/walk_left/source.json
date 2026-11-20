@@ -1,0 +1,12 @@
+{
+  "video": "data/_walk_raw/clip1.mp4",
+  "src_fps": 24.0,
+  "scale": 0.4440344403444034,
+  "canvas": [
+    320,
+    416
+  ],
+  "baseline": 408,
+  "frames": 22,
+  "native_fps": 24.0
+}

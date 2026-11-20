@@ -272,7 +272,7 @@ class ManualInputCapture:
         if self.owner._manual_capture_hold.is_set():
             self.close();self.owner._manual_capture_released.set()
         elif self.stream is None:
-            stream=self.audio.RawInputStream(samplerate=16000,channels=1,dtype='int16',blocksize=self.owner.input_blocksize,
+            stream=self.audio.RawInputStream(samplerate=16000,channels=1,dtype='int16',blocksize=getattr(self.owner,'input_blocksize',4000),
                 device=self.owner._cfg.get('input_device'),callback=self.owner._capture)
             stream.__enter__();self.stream=stream;self.owner._manual_capture_released.clear()
     def close(self):

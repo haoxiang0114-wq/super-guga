@@ -38,7 +38,51 @@ def resolve_config(raw,home=None):
         try:stored=(yaml.safe_load((home/'.dsh/.credentials.yaml').read_text(encoding='utf-8')) or {}).get('refs',{})
         except (OSError,ValueError):stored={}
         cfg['api_key']=stored.get(ref) or os.environ.get(ref,'')
+    if cfg.get('driver_source')!='dsh' and _chat_unusable(cfg):
+        fallback=_qwen_chat(raw)
+        if fallback:
+            cfg['configured_base_url']=cfg.get('base_url','')
+            cfg['configured_model']=cfg.get('model','')
+            cfg.update(fallback)
+            cfg['auto_fallback']=True
     return cfg
+
+
+QWEN_MAAS_CHAT='https://maas.qianwenaiapi.com/compatible-mode/v1'
+DEFAULT_QWEN_CHAT_MODEL='deepseek-v4.1-flash-1017'
+
+
+def placeholder(value):
+    """占位符不是密钥：example 配置里的 YOUR_xxx 一律当没填。"""
+    text=str(value or '').strip()
+    if not text:return True
+    low=text.lower()
+    return (low.startswith('your_') or low.startswith('sk-your') or
+            'your_openai_compatible_endpoint' in low or low.startswith('your-'))
+
+
+def _chat_unusable(cfg):
+    return placeholder(cfg.get('api_key')) or placeholder(cfg.get('base_url')) or not str(cfg.get('model','')).strip()
+
+
+def _qwen_chat(raw):
+    """聊天模型没配时，借用千问语音那把 Key 的兼容通道（同一把 Key 已能调文本模型）。
+
+    这样用户只填一个千问 Key，查词、答疑、桌宠对话就都能跑；想指定别的模型，
+    在 ai_config.json 里写 qwen_chat.model，或者干脆填自己的 base_url/api_key。
+    """
+    block=raw.get('qwen_chat') if isinstance(raw.get('qwen_chat'),dict) else {}
+    if block.get('enabled') is False:return None
+    if os.environ.get('GUGA_QWEN_CHAT','').strip().lower() in ('0','off','false','no'):return None
+    try:
+        from core import qwen_speech
+        key=str(qwen_speech.speech_settings().get('api_key') or '')
+    except Exception:
+        return None
+    if placeholder(key):return None
+    return dict(base_url=str(block.get('base_url') or QWEN_MAAS_CHAT).rstrip('/'),
+                api_key=key,model=str(block.get('model') or DEFAULT_QWEN_CHAT_MODEL),
+                driver_source='qwen-maas')
 
 
 def load_config(path=CONFIG):
